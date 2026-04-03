@@ -30,6 +30,7 @@
 #include <list>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread> // for hardware_concurrency
 #include <vector>
@@ -2560,6 +2561,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
+    add_opt(common_arg(
+        {"--model-parts"}, "PATH1,PATH2,...",
+        "comma-separated ordered list of split GGUF file paths (bypasses filename-based split discovery)",
+        [](common_params & params, const std::string & value) {
+            params.model.split_paths.clear();
+            std::istringstream ss(value);
+            std::string part;
+            while (std::getline(ss, part, ',')) {
+                if (!part.empty()) {
+                    params.model.split_paths.push_back(part);
+                }
+            }
+            if (params.model.path.empty() && !params.model.split_paths.empty()) {
+                params.model.path = params.model.split_paths.front();
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}));
     add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",

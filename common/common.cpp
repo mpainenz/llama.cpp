@@ -1154,7 +1154,17 @@ common_init_result::common_init_result(common_params & params) :
             params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    llama_model * model = nullptr;
+    if (!params.model.split_paths.empty()) {
+        std::vector<const char *> paths;
+        paths.reserve(params.model.split_paths.size());
+        for (const auto & p : params.model.split_paths) {
+            paths.push_back(p.c_str());
+        }
+        model = llama_model_load_from_splits(paths.data(), paths.size(), mparams);
+    } else {
+        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    }
     if (model == NULL) {
         return;
     }

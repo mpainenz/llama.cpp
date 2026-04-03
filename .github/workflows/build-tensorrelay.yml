@@ -1,0 +1,138 @@
+name: TensorRelay Build
+
+on:
+  push:
+    branches: [tensorrelay]
+  workflow_dispatch:
+
+concurrency:
+  group: tensorrelay-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_COMMON: >-
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_BUILD_SERVER=ON
+    -DGGML_RPC=ON
+    -DGGML_NATIVE=OFF
+    -DGGML_BACKEND_DL=ON
+    -DGGML_CPU_ALL_VARIANTS=ON
+
+jobs:
+  linux-vulkan-x64:
+    name: Linux Vulkan x64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_VULKAN=ON \
+            ${{ env.CMAKE_COMMON }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Pack artifacts
+        run: |
+          mkdir -p dist
+          cp build/bin/llama-server dist/
+          cp build/bin/rpc-server dist/
+          find build/bin -name '*.so' -exec cp {} dist/ \;
+          cp LICENSE dist/
+          tar -czvf llama-tensorrelay-linux-vulkan-x64.tar.gz -C dist .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-tensorrelay-linux-vulkan-x64
+          path: llama-tensorrelay-linux-vulkan-x64.tar.gz
+          retention-days: 30
+
+  windows-cuda-x64:
+    name: Windows CUDA 13.1 x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.1'
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DGGML_RPC=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: Pack artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item build\bin\Release\llama-server.exe dist\
+          Copy-Item build\bin\Release\rpc-server.exe dist\
+          Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination dist\
+          Copy-Item LICENSE dist\
+          Compress-Archive -Path dist\* -DestinationPath llama-tensorrelay-win-cuda-13.1-x64.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-tensorrelay-win-cuda-13.1-x64
+          path: llama-tensorrelay-win-cuda-13.1-x64.zip
+          retention-days: 30
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [linux-vulkan-x64, windows-cuda-x64]
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tensorrelay-${{ github.sha }}
+          name: TensorRelay Build ${{ github.sha }}
+          body: |
+            Automated build from tensorrelay branch.
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: true
+          files: |
+            artifacts/llama-tensorrelay-linux-vulkan-x64/llama-tensorrelay-linux-vulkan-x64.tar.gz
+            artifacts/llama-tensorrelay-win-cuda-13.1-x64/llama-tensorrelay-win-cuda-13.1-x64.zip

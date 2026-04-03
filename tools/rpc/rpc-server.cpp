@@ -1,4 +1,6 @@
 #include "ggml-rpc.h"
+#include "ggml.h"
+#include "gguf.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
@@ -11,6 +13,7 @@
 #  include <sys/stat.h>
 #endif
 #include <algorithm>
+#include <cinttypes>
 #include <clocale>
 #include <codecvt>
 #include <filesystem>
@@ -169,10 +172,90 @@ static std::string fs_get_cache_directory() {
     return ensure_trailing_slash(cache_directory);
 }
 
+static constexpr size_t RPC_HASH_THRESHOLD = 10 * 1024 * 1024; // must match HASH_THRESHOLD in ggml-rpc.cpp
+
+static uint64_t rpc_fnv_hash(const uint8_t * data, size_t len) {
+    const uint64_t fnv_prime = 0x100000001b3ULL;
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= data[i];
+        hash *= fnv_prime;
+    }
+    return hash;
+}
+
+static bool preseed_cache_from_gguf(const std::string & model_path, const std::string & cache_dir) {
+    struct gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    struct gguf_context * gguf_ctx = gguf_init_from_file(model_path.c_str(), params);
+    if (!gguf_ctx) {
+        fprintf(stderr, "Failed to open GGUF file: %s\n", model_path.c_str());
+        return false;
+    }
+
+    const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx);
+    const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+    int seeded = 0;
+
+    FILE * fp = fopen(model_path.c_str(), "rb");
+    if (!fp) {
+        fprintf(stderr, "Failed to reopen GGUF file for reading: %s\n", model_path.c_str());
+        gguf_free(gguf_ctx);
+        return false;
+    }
+
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const size_t tensor_size = gguf_get_tensor_size(gguf_ctx, i);
+        if (tensor_size <= RPC_HASH_THRESHOLD) {
+            continue;
+        }
+
+        const size_t tensor_offset = data_offset + gguf_get_tensor_offset(gguf_ctx, i);
+        std::vector<uint8_t> buf(tensor_size);
+
+#ifdef _WIN32
+        if (_fseeki64(fp, (__int64)tensor_offset, SEEK_SET) != 0) {
+#else
+        if (fseeko(fp, (off_t)tensor_offset, SEEK_SET) != 0) {
+#endif
+            fprintf(stderr, "Failed to seek to tensor %s\n", gguf_get_tensor_name(gguf_ctx, i));
+            continue;
+        }
+        if (fread(buf.data(), 1, tensor_size, fp) != tensor_size) {
+            fprintf(stderr, "Failed to read tensor %s\n", gguf_get_tensor_name(gguf_ctx, i));
+            continue;
+        }
+
+        uint64_t hash = rpc_fnv_hash(buf.data(), tensor_size);
+        char hash_str[17];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+
+        std::filesystem::path cache_file = std::filesystem::path(cache_dir) / hash_str;
+        if (std::filesystem::exists(cache_file)) {
+            seeded++;
+            continue;
+        }
+
+        std::ofstream ofs(cache_file, std::ios::binary);
+        if (!ofs) {
+            fprintf(stderr, "Failed to write cache file: %s\n", cache_file.string().c_str());
+            continue;
+        }
+        ofs.write(reinterpret_cast<const char *>(buf.data()), tensor_size);
+        seeded++;
+    }
+
+    fclose(fp);
+    gguf_free(gguf_ctx);
+
+    printf("Pre-seeded %d tensor(s) from %s into cache\n", seeded, model_path.c_str());
+    return true;
+}
+
 struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
+    std::string              model_path;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
@@ -186,6 +269,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -m, --model PATH                 pre-warm cache from a GGUF file (implies --cache)\n");
     fprintf(stderr, "\n");
 }
 
@@ -232,6 +316,12 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
         } else if (arg == "-c" || arg == "--cache") {
+            params.use_cache = true;
+        } else if (arg == "-m" || arg == "--model") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.model_path = argv[i];
             params.use_cache = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
@@ -323,6 +413,12 @@ int main(int argc, char * argv[]) {
             return 1;
         }
         cache_dir = cache_dir_str.c_str();
+    }
+
+    if (!params.model_path.empty()) {
+        if (!preseed_cache_from_gguf(params.model_path, cache_dir_str)) {
+            fprintf(stderr, "Warning: failed to pre-seed cache from model file\n");
+        }
     }
 
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");

@@ -305,6 +305,8 @@ struct common_params_model {
     std::string hf_file     = ""; // HF file                                                // NOLINT
     std::string docker_repo = ""; // Docker repo                                            // NOLINT
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
+
+    std::vector<std::string> split_paths; // explicit split file paths (bypasses filename-based discovery)  // NOLINT
 };
 
 struct common_ngram_mod;
