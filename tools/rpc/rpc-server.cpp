@@ -17,6 +17,7 @@
 #include <clocale>
 #include <codecvt>
 #include <filesystem>
+#include <fstream>
 #include <regex>
 #include <stdio.h>
 #include <string>
