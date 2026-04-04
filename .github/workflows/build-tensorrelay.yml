@@ -40,6 +40,7 @@ jobs:
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_VULKAN=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_COMMON }}
           cmake --build build --config Release -j $(nproc)
 
@@ -80,6 +81,7 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             -DLLAMA_BUILD_EXAMPLES=OFF ^
             -DLLAMA_BUILD_TESTS=OFF ^
             -DLLAMA_BUILD_TOOLS=ON ^
@@ -98,7 +100,13 @@ jobs:
           Copy-Item build\bin\Release\llama-server.exe dist\
           Copy-Item build\bin\Release\rpc-server.exe dist\
           Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination dist\
+          # Bundle CUDA runtime DLLs (not in build output, installed system-wide by toolkit)
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          Copy-Item "$cudaBin\cublas64_*.dll" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "$cudaBin\cublasLt64_*.dll" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "$cudaBin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
           Copy-Item LICENSE dist\
+          Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
           Compress-Archive -Path dist\* -DestinationPath llama-tensorrelay-win-cuda-13.1-x64.zip
 
       - name: Upload artifacts
