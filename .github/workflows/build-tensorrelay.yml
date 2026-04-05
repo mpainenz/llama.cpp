@@ -100,7 +100,6 @@ jobs:
           Copy-Item build\bin\Release\llama-server.exe dist\
           Copy-Item build\bin\Release\rpc-server.exe dist\
           Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination dist\
-          # Bundle CUDA runtime DLLs (not in build output, installed system-wide by toolkit)
           $cudaBin = Join-Path $env:CUDA_PATH "bin"
           Copy-Item "$cudaBin\cublas64_*.dll" dist\ -ErrorAction SilentlyContinue
           Copy-Item "$cudaBin\cublasLt64_*.dll" dist\ -ErrorAction SilentlyContinue
