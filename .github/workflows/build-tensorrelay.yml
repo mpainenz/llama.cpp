@@ -49,8 +49,10 @@ jobs:
           mkdir -p dist
           cp build/bin/llama-server dist/
           cp build/bin/rpc-server dist/
-          find build/bin -name '*.so' -exec cp {} dist/ \;
+          find build/bin -name '*.so*' -exec cp -P {} dist/ \;
           cp LICENSE dist/
+          echo "Packed libraries:"
+          ls -lh dist/*.so* || true
           tar -czvf llama-tensorrelay-linux-vulkan-x64.tar.gz -C dist .
 
       - name: Upload artifacts
@@ -100,7 +102,11 @@ jobs:
           Copy-Item build\bin\Release\llama-server.exe dist\
           Copy-Item build\bin\Release\rpc-server.exe dist\
           Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination dist\
-          Get-ChildItem -Path $env:CUDA_PATH -Recurse -Include "cudart64_*.dll","cublas64_*.dll","cublasLt64_*.dll" | Copy-Item -Destination dist\
+          # Bundle CUDA runtime DLLs (not in build output, installed system-wide by toolkit)
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          Copy-Item "$cudaBin\cublas64_*.dll" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "$cudaBin\cublasLt64_*.dll" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "$cudaBin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
           Copy-Item LICENSE dist\
           Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
           Compress-Archive -Path dist\* -DestinationPath llama-tensorrelay-win-cuda-13.1-x64.zip

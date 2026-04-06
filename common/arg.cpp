@@ -56,6 +56,29 @@ extern const char * LICENSES[];
 using json = nlohmann::ordered_json;
 using namespace common_arg_utils;
 
+#include <filesystem>
+static std::string common_get_exe_directory() {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    std::vector<wchar_t> buf(MAX_PATH);
+    DWORD len = GetModuleFileNameW(NULL, buf.data(), (DWORD)buf.size());
+    while (len == buf.size()) {
+        buf.resize(buf.size() * 2);
+        len = GetModuleFileNameW(NULL, buf.data(), (DWORD)buf.size());
+    }
+    if (len == 0) { return ""; }
+    fs::path p(std::wstring(buf.data(), len));
+    return p.parent_path().u8string();
+#elif defined(__linux__) || defined(__FreeBSD__)
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) { return ""; }
+    return exe.parent_path().string();
+#else
+    return "";
+#endif
+}
+
 static std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_MTMD,
     LLAMA_EXAMPLE_SERVER,
@@ -999,8 +1022,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     params.use_color = tty_can_use_colors();
 
-    // load dynamic backends
-    ggml_backend_load_all();
+    // load dynamic backends from the executable's own directory only,
+    // preventing pickup of system-installed ggml backend libraries
+    std::string exe_dir = common_get_exe_directory();
+    if (!exe_dir.empty()) {
+        ggml_backend_load_all_from_path(exe_dir.c_str());
+    } else {
+        ggml_backend_load_all();
+    }
 
     common_params_context ctx_arg(params);
     ctx_arg.print_usage = print_usage;

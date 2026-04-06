@@ -378,10 +378,31 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
     return devices;
 }
 
+static std::string get_exe_directory() {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    std::vector<wchar_t> buf(MAX_PATH);
+    DWORD len = GetModuleFileNameW(NULL, buf.data(), (DWORD)buf.size());
+    while (len == buf.size()) {
+        buf.resize(buf.size() * 2);
+        len = GetModuleFileNameW(NULL, buf.data(), (DWORD)buf.size());
+    }
+    if (len == 0) { return "."; }
+    fs::path p(std::wstring(buf.data(), len));
+    return p.parent_path().u8string();
+#else
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) { return "."; }
+    return exe.parent_path().string();
+#endif
+}
+
 int main(int argc, char * argv[]) {
     std::setlocale(LC_NUMERIC, "C");
 
-    ggml_backend_load_all();
+    std::string exe_dir = get_exe_directory();
+    ggml_backend_load_all_from_path(exe_dir.c_str());
 
     rpc_server_params params;
     if (!rpc_server_params_parse(argc, argv, params)) {
