@@ -49,10 +49,13 @@ jobs:
           mkdir -p dist
           cp build/bin/llama-server dist/
           cp build/bin/rpc-server dist/
-          find build/bin -name '*.so*' -exec cp -P {} dist/ \;
+          # Copy all .so variants as real files (no symlinks — SteamPipe drops them)
+          find build/bin -name '*.so*' -exec cp -L {} dist/ \;
           cp LICENSE dist/
           echo "Packed libraries:"
           ls -lh dist/*.so* || true
+          # Verify versioned SONAMEs are present (not just unversioned .so)
+          ls dist/*.so.0 >/dev/null 2>&1 || { echo "::error::No .so.0 files found — SONAME resolution will fail"; exit 1; }
           tar -czvf llama-tensorrelay-linux-vulkan-x64.tar.gz -C dist .
 
       - name: Upload artifacts
