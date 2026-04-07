@@ -18,7 +18,6 @@ env:
     -DGGML_RPC=ON
     -DGGML_NATIVE=OFF
     -DGGML_BACKEND_DL=ON
-    -DGGML_CPU_ALL_VARIANTS=ON
 
 jobs:
   linux-vulkan-x64:
@@ -40,6 +39,7 @@ jobs:
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_VULKAN=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_COMMON }}
           cmake --build build --config Release -j $(nproc)
@@ -79,22 +79,24 @@ jobs:
       - name: Install Ninja
         run: choco install ninja
 
+      - name: Cache Windows CUDA build
+        id: cache-win-build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: win-cuda13.1-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
+
       - name: Build
+        if: steps.cache-win-build.outputs.cache-hit != 'true'
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;100;120" ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DLLAMA_BUILD_EXAMPLES=OFF ^
-            -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_TOOLS=ON ^
-            -DLLAMA_BUILD_SERVER=ON ^
-            -DGGML_RPC=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU_ALL_VARIANTS=ON
+            ${{ env.CMAKE_COMMON }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
