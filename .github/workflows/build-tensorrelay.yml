@@ -26,6 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Show RPC protocol version from source
+        run: |
+          echo "=== RPC Protocol Version in Source ==="
+          grep -E 'RPC_PROTO_(MAJOR|MINOR|PATCH)_VERSION' ggml/include/ggml-rpc.h
+          echo "======================================"
+
       - name: Install Vulkan SDK
         run: |
           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
@@ -58,6 +64,13 @@ jobs:
           ls -lh dist/*.so* || true
           # Verify versioned SONAMEs are present (not just unversioned .so)
           ls dist/*.so.0 >/dev/null 2>&1 || { echo "::error::No .so.0 files found — SONAME resolution will fail"; exit 1; }
+          
+          # Smoke test: verify libggml-rpc.so contains expected version string
+          if [ -f dist/libggml-rpc.so ]; then
+            echo "=== Checking libggml-rpc.so for version string ==="
+            strings dist/libggml-rpc.so | grep "Starting RPC server" || echo "::warning::Version string not found in libggml-rpc.so"
+          fi
+          
           tar -czvf llama-tensorrelay-linux-vulkan-x64.tar.gz -C dist .
 
       - name: Upload artifacts
@@ -72,6 +85,13 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      - name: Show RPC protocol version from source
+        shell: pwsh
+        run: |
+          Write-Host "=== RPC Protocol Version in Source ==="
+          Select-String -Path ggml/include/ggml-rpc.h -Pattern "RPC_PROTO_(MAJOR|MINOR|PATCH)_VERSION"
+          Write-Host "======================================"
 
       - name: Install CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
