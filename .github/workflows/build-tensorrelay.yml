@@ -156,11 +156,16 @@ jobs:
             artifacts/llama-tensorrelay-win-cuda-13.1-x64/llama-tensorrelay-win-cuda-13.1-x64.zip
 
       - name: Trigger TensorRelay Steam build
-        if: secrets.TENSORRELAY_DISPATCH_TOKEN != ''
+        env:
+          DISPATCH_TOKEN: ${{ secrets.TENSORRELAY_DISPATCH_TOKEN }}
         run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "TENSORRELAY_DISPATCH_TOKEN not set; skip dispatch"
+            exit 0
+          fi
           curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token ${{ secrets.TENSORRELAY_DISPATCH_TOKEN }}" \
+            -H "Authorization: token ${DISPATCH_TOKEN}" \
             https://api.github.com/repos/mpainenz/tensorrelay/dispatches \
             -d '{"event_type":"llama-fork-release","client_payload":{"tag":"tensorrelay-${{ github.sha }}","commit":"${{ github.sha }}"}}'
           echo "Dispatched llama-fork-release to mpainenz/tensorrelay with tag tensorrelay-${{ github.sha }}"
