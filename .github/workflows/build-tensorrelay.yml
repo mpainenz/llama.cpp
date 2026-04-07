@@ -35,6 +35,8 @@ jobs:
 
       - name: Build
         run: |
+          # Fresh tree avoids stale object files (e.g. ggml-rpc with old RPC_PROTO_*).
+          rm -rf build
           cmake -B build \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -84,13 +86,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: win-cuda13.1-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
+          key: win-cuda13.1-v2-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
 
       - name: Build
         if: steps.cache-win-build.outputs.cache-hit != 'true'
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if exist build rmdir /s /q build
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
