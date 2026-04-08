@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -2276,9 +2277,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DEVICE"));
     add_opt(common_arg(
+        {"--list-devices-format"}, "FMT",
+        "with --list-devices: output as text (default) or json (single JSON object on stdout; place this before --list-devices)\n"
+        "(env: LLAMA_ARG_LIST_DEVICES_FORMAT)",
+        [](common_params & params, const std::string & value) {
+            if (value == "text" || value == "json") {
+                params.list_devices_format = value;
+            } else {
+                throw std::invalid_argument("expected text or json");
+            }
+        }
+    ).set_env("LLAMA_ARG_LIST_DEVICES_FORMAT"));
+    add_opt(common_arg(
         {"--list-devices"},
         "print list of available devices and exit",
-        [](common_params &) {
+        [](common_params & params) {
             std::vector<ggml_backend_dev_t> devices;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
@@ -2286,11 +2299,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     devices.push_back(dev);
                 }
             }
-            printf("Available devices:\n");
-            for (auto * dev : devices) {
-                size_t free, total;
-                ggml_backend_dev_memory(dev, &free, &total);
-                printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+            if (params.list_devices_format == "json") {
+                auto backend_prefix = [](const std::string & name) -> std::string {
+                    size_t i = 0;
+                    while (i < name.size() && !std::isdigit(static_cast<unsigned char>(name[i]))) {
+                        ++i;
+                    }
+                    if (i == 0) {
+                        return {};
+                    }
+                    return name.substr(0, i);
+                };
+                json j;
+                j["schema_version"] = 1;
+                json arr = json::array();
+                std::set<std::string> backends_set;
+                for (auto * dev : devices) {
+                    size_t free = 0;
+                    size_t total = 0;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    const char * name_c = ggml_backend_dev_name(dev);
+                    const char * desc_c = ggml_backend_dev_description(dev);
+                    const std::string name = name_c ? name_c : "";
+                    const std::string desc = desc_c ? desc_c : "";
+                    const std::string backend = backend_prefix(name);
+                    if (!backend.empty()) {
+                        backends_set.insert(backend);
+                    }
+                    json item;
+                    item["name"]        = name;
+                    item["backend"]     = backend;
+                    item["description"] = desc;
+                    item["memory_total_mb"] = static_cast<int64_t>(total / 1024 / 1024);
+                    item["memory_free_mb"]  = static_cast<int64_t>(free  / 1024 / 1024);
+                    arr.push_back(std::move(item));
+                }
+                j["devices"] = std::move(arr);
+                json backends = json::array();
+                for (const auto & b : backends_set) {
+                    backends.push_back(b);
+                }
+                j["backends"] = std::move(backends);
+                printf("%s\n", j.dump().c_str());
+            } else {
+                printf("Available devices:\n");
+                for (auto * dev : devices) {
+                    size_t free, total;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+                }
             }
             exit(0);
         }
