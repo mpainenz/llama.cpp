@@ -1155,15 +1155,24 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     llama_model * model = nullptr;
-    if (!params.model.split_paths.empty()) {
-        std::vector<const char *> paths;
-        paths.reserve(params.model.split_paths.size());
-        for (const auto & p : params.model.split_paths) {
-            paths.push_back(p.c_str());
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!params.model.split_paths.empty()) {
+            LOG_INF("%s: loading model from %zu split file(s)\n", __func__, params.model.split_paths.size());
+            std::vector<const char *> paths;
+            paths.reserve(params.model.split_paths.size());
+            for (const auto & p : params.model.split_paths) {
+                paths.push_back(p.c_str());
+            }
+            model = llama_model_load_from_splits(paths.data(), paths.size(), mparams);
+        } else {
+            LOG_INF("%s: loading model from %s\n", __func__, params.model.path.c_str());
+            model = llama_model_load_from_file(params.model.path.c_str(), mparams);
         }
-        model = llama_model_load_from_splits(paths.data(), paths.size(), mparams);
-    } else {
-        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        const double t_model_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (model) {
+            LOG_INF("%s: model weights loaded in %.2f s\n", __func__, t_model_s);
+        }
     }
     if (model == NULL) {
         return;
@@ -1240,11 +1249,15 @@ common_init_result::common_init_result(common_params & params) :
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    LOG_INF("%s: constructing inference context (KV cache + compute graph)\n", __func__);
+    const auto t_ctx0 = std::chrono::steady_clock::now();
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
     }
+    LOG_INF("%s: inference context ready in %.2f s\n", __func__,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ctx0).count());
 
     pimpl->context.reset(lctx);
 }
@@ -1346,7 +1359,8 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     }
 
     if (params.warmup) {
-        LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
+        LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
+        const auto t_warmup0 = std::chrono::steady_clock::now();
 
         llama_set_warmup(lctx, true);
 
@@ -1381,6 +1395,9 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
         llama_set_warmup(lctx, false);
+
+        LOG_INF("%s: warmup complete in %.2f s\n", __func__,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warmup0).count());
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();

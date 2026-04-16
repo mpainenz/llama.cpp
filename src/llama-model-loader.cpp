@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -1407,6 +1408,14 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    LLAMA_LOG_INFO("%s: reading tensor data — %zu tensor(s), %.2f GiB total across %zu file(s)\n",
+        __func__,
+        weights_map.size(),
+        (double)size_data / (1024.0 * 1024.0 * 1024.0),
+        files.size());
+
+    const auto t_load_start = std::chrono::steady_clock::now();
+
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
@@ -1508,11 +1517,21 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    uint16_t last_shard_idx = UINT16_MAX;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
+        }
+
+        // Log shard transitions so we can see which file is being read.
+        if (weight->idx != last_shard_idx) {
+            if (last_shard_idx != UINT16_MAX) {
+                LLAMA_LOG_INFO("%s: finished reading shard %u\n", __func__, last_shard_idx);
+            }
+            LLAMA_LOG_INFO("%s: reading shard %u / %zu\n", __func__, (unsigned)weight->idx + 1, files.size());
+            last_shard_idx = weight->idx;
         }
 
         if (progress_callback) {
@@ -1630,6 +1649,12 @@ bool llama_model_loader::load_all_data(
 
         size_done += n_size;
     }
+
+    if (last_shard_idx != UINT16_MAX) {
+        LLAMA_LOG_INFO("%s: finished reading shard %u\n", __func__, last_shard_idx);
+    }
+    LLAMA_LOG_INFO("%s: tensor data read complete in %.2f s\n", __func__,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load_start).count());
 
     // free temporary resources used for async uploads
     for (auto * event : events) {

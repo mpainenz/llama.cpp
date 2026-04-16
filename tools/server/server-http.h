@@ -57,6 +57,12 @@ struct server_http_context {
     std::thread thread; // server thread
     std::atomic<bool> is_ready = false;
 
+    // Coarse loading phase reported in the 503 response body while is_ready is
+    // false.  Set by server.cpp before and after calling load_model() so the
+    // client can distinguish "HTTP server starting up" from "model loading".
+    // 0 = initializing, 1 = loading_model
+    std::atomic<int> loading_phase = 0;
+
     std::string path_prefix;
     std::string hostname;
     int port;

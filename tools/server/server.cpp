@@ -270,6 +270,7 @@ int main(int argc, char ** argv) {
 
         // load the model
         LOG_INF("%s: loading model\n", __func__);
+        ctx_http.loading_phase.store(1); // loading_model
 
         if (server_models::is_child_server()) {
             ctx_server.on_sleeping_changed([&](bool sleeping) {

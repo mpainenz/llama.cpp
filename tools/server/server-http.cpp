@@ -199,6 +199,10 @@ bool server_http_context::init(const common_params & params) {
     auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
         bool ready = is_ready.load();
         if (!ready) {
+            static const char * const phase_names[] = { "initializing", "loading_model" };
+            int phase = loading_phase.load();
+            const char * phase_name = (phase >= 0 && phase < (int)(sizeof(phase_names)/sizeof(phase_names[0])))
+                ? phase_names[phase] : "loading_model";
 #ifdef LLAMA_BUILD_WEBUI
             auto tmp = string_split<std::string>(req.path, '.');
             if (req.path == "/" || tmp.back() == "html") {
@@ -215,7 +219,8 @@ bool server_http_context::init(const common_params & params) {
                         {"error", {
                             {"message", "Loading model"},
                             {"type", "unavailable_error"},
-                            {"code", 503}
+                            {"code", 503},
+                            {"loading_phase", phase_name}
                         }}
                     }),
                     "application/json; charset=utf-8"
