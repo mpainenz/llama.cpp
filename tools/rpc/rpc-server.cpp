@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__linux__)
@@ -173,7 +174,7 @@ static std::string fs_get_cache_directory() {
     return ensure_trailing_slash(cache_directory);
 }
 
-static constexpr size_t RPC_HASH_THRESHOLD = 10 * 1024 * 1024; // must match HASH_THRESHOLD in ggml-rpc.cpp
+static constexpr size_t RPC_HASH_THRESHOLD = 64 * 1024; // must match HASH_THRESHOLD in ggml-rpc.cpp
 
 static uint64_t rpc_fnv_hash(const uint8_t * data, size_t len) {
     const uint64_t fnv_prime = 0x100000001b3ULL;
@@ -185,7 +186,7 @@ static uint64_t rpc_fnv_hash(const uint8_t * data, size_t len) {
     return hash;
 }
 
-static bool preseed_cache_from_gguf(const std::string & model_path, const std::string & cache_dir) {
+static bool build_tensor_map(const std::string & model_path, std::unordered_map<uint64_t, TensorLocation> & tensor_map) {
     struct gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
     struct gguf_context * gguf_ctx = gguf_init_from_file(model_path.c_str(), params);
     if (!gguf_ctx) {
@@ -195,7 +196,8 @@ static bool preseed_cache_from_gguf(const std::string & model_path, const std::s
 
     const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx);
     const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-    int seeded = 0;
+    int indexed = 0;
+    int below_threshold = 0;
 
     FILE * fp = fopen(model_path.c_str(), "rb");
     if (!fp) {
@@ -207,6 +209,7 @@ static bool preseed_cache_from_gguf(const std::string & model_path, const std::s
     for (int64_t i = 0; i < n_tensors; i++) {
         const size_t tensor_size = gguf_get_tensor_size(gguf_ctx, i);
         if (tensor_size <= RPC_HASH_THRESHOLD) {
+            below_threshold++;
             continue;
         }
 
@@ -227,28 +230,20 @@ static bool preseed_cache_from_gguf(const std::string & model_path, const std::s
         }
 
         uint64_t hash = rpc_fnv_hash(buf.data(), tensor_size);
-        char hash_str[17];
-        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-
-        std::filesystem::path cache_file = std::filesystem::path(cache_dir) / hash_str;
-        if (std::filesystem::exists(cache_file)) {
-            seeded++;
-            continue;
-        }
-
-        std::ofstream ofs(cache_file, std::ios::binary);
-        if (!ofs) {
-            fprintf(stderr, "Failed to write cache file: %s\n", cache_file.string().c_str());
-            continue;
-        }
-        ofs.write(reinterpret_cast<const char *>(buf.data()), tensor_size);
-        seeded++;
+        
+        TensorLocation loc;
+        loc.path = model_path;
+        loc.offset = tensor_offset;
+        loc.size = tensor_size;
+        tensor_map[hash] = loc;
+        indexed++;
     }
 
     fclose(fp);
     gguf_free(gguf_ctx);
 
-    printf("Pre-seeded %d tensor(s) from %s into cache\n", seeded, model_path.c_str());
+    printf("Tensor map: %d/%d tensors from %s indexed (threshold %zu B, %d tensors below threshold)\n", 
+           indexed, (int)n_tensors, model_path.c_str(), RPC_HASH_THRESHOLD, below_threshold);
     return true;
 }
 
@@ -437,9 +432,14 @@ int main(int argc, char * argv[]) {
         cache_dir = cache_dir_str.c_str();
     }
 
+    // Build tensor map from model path
+    std::unordered_map<uint64_t, TensorLocation> tensor_map;
+    const std::unordered_map<uint64_t, TensorLocation> * tensor_map_ptr = nullptr;
     if (!params.model_path.empty()) {
-        if (!preseed_cache_from_gguf(params.model_path, cache_dir_str)) {
-            fprintf(stderr, "Warning: failed to pre-seed cache from model file\n");
+        if (build_tensor_map(params.model_path, tensor_map)) {
+            tensor_map_ptr = &tensor_map;
+        } else {
+            fprintf(stderr, "Warning: failed to build tensor map from model file\n");
         }
     }
 
@@ -449,12 +449,15 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    auto start_server_fn = (decltype(ggml_backend_rpc_start_server)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    // Note: This function pointer type now includes the tensor_map_ptr parameter
+    using start_server_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *, 
+                                       const std::unordered_map<uint64_t, TensorLocation> *);
+    auto start_server_fn = (start_server_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(), tensor_map_ptr);
     return 0;
 }

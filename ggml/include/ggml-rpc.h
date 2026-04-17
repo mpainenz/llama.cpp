@@ -2,6 +2,17 @@
 
 #include "ggml-backend.h"
 
+#ifdef __cplusplus
+#include <unordered_map>
+#include <string>
+
+struct TensorLocation {
+    std::string path;
+    size_t offset;
+    size_t size;
+};
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -24,8 +35,17 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
+#ifdef __cplusplus
+}
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+                                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                                    const std::unordered_map<uint64_t, TensorLocation> * tensor_map_ptr = nullptr);
+extern "C" {
+#else
+GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                                    const void * tensor_map_ptr);
+#endif
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

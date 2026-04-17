@@ -113,7 +113,7 @@ enum rpc_cmd {
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
-const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+const size_t HASH_THRESHOLD = 64 * 1024;
 
 struct rpc_msg_hello_rsp {
     uint8_t major;
@@ -985,8 +985,10 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, 
+               const std::unordered_map<uint64_t, TensorLocation> * tensor_map_ptr = nullptr)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), tensor_map_ptr(tensor_map_ptr),
+          tensor_hits(0), tensor_misses(0), bytes_saved(0) {
         stored_graphs.resize(backends.size());
     }
     ~rpc_server();
@@ -1024,9 +1026,14 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    const std::unordered_map<uint64_t, TensorLocation> * tensor_map_ptr;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    // Tensor map hit/miss tracking
+    size_t tensor_hits;
+    size_t tensor_misses;
+    size_t bytes_saved;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1280,12 +1287,46 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
-    std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file)) {
-        response.result = 0;
-        return true;
+    std::vector<uint8_t> data_buffer;
+    bool from_gguf_map = false;
+    
+    // Try tensor map first (fast path - read from local GGUF)
+    if (tensor_map_ptr != nullptr) {
+        auto it = tensor_map_ptr->find(request.hash);
+        if (it != tensor_map_ptr->end()) {
+            const TensorLocation & loc = it->second;
+            data_buffer.resize(loc.size);
+            
+            FILE * fp = fopen(loc.path.c_str(), "rb");
+            if (fp) {
+#ifdef _WIN32
+                if (_fseeki64(fp, (__int64)loc.offset, SEEK_SET) == 0) {
+#else
+                if (fseeko(fp, (off_t)loc.offset, SEEK_SET) == 0) {
+#endif
+                    if (fread(data_buffer.data(), 1, loc.size, fp) == loc.size) {
+                        from_gguf_map = true;
+                        tensor_hits++;
+                        bytes_saved += loc.size;
+                        LOG_DBG("[%s] served from local GGUF (hash=%016" PRIx64 ", size=%zu)\n", 
+                                __func__, request.hash, loc.size);
+                    }
+                }
+                fclose(fp);
+            }
+        }
     }
-    size_t size = cached_file.size();
+    
+    // Fall back to file cache if tensor map miss
+    if (!from_gguf_map) {
+        if (!get_cached_file(request.hash, data_buffer)) {
+            tensor_misses++;
+            response.result = 0;
+            return true;
+        }
+    }
+    
+    size_t size = data_buffer.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1315,7 +1356,7 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    ggml_backend_tensor_set(tensor, data_buffer.data(), request.offset, size);
     response.result = 1;
     return true;
 }
@@ -1587,14 +1628,19 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    if (tensor_map_ptr != nullptr && (tensor_hits > 0 || tensor_misses > 0)) {
+        printf("[rpc-server] tensor cache summary: %zu hits (%zu bytes saved), %zu misses\n", 
+               tensor_hits, bytes_saved, tensor_misses);
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                             const std::unordered_map<uint64_t, TensorLocation> * tensor_map_ptr,
                              sockfd_t sockfd) {
-    rpc_server server(backends, cache_dir);
+    rpc_server server(backends, cache_dir, tensor_map_ptr);
     uint8_t cmd;
     if (!recv_data(sockfd, &cmd, 1)) {
         return;
@@ -1841,7 +1887,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                   const std::unordered_map<uint64_t, TensorLocation> * tensor_map_ptr) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
@@ -1903,7 +1950,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket->fd);
+        rpc_serve_client(backends, cache_dir, tensor_map_ptr, client_socket->fd);
         printf("Client connection closed\n");
         fflush(stdout);
     }
