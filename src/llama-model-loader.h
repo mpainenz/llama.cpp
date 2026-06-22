@@ -31,12 +31,19 @@ const char * llama_file_version_name(llama_fver version);
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
-        uint16_t  idx; // source file index
-        size_t   offs; // tensor data offset in the original file
+        uint16_t  idx;  // source file index
+        size_t   offs;  // tensor data offset in the original file
 
         ggml_tensor * tensor;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        // TensorRelay model-part-stub: the bytes of this tensor are NOT present in
+        // any local file. It belongs to a peer shard and must be materialized on a
+        // remote RPC device by FNV-1a hash at load time (see ADR-0014). When set,
+        // `offs` is meaningless and must never be used to read from `files[idx]`.
+        bool     is_stub_hash = false;
+        uint64_t stub_hash    = 0;
+
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), offs(0), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
@@ -47,6 +54,11 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // Hash-backed (stub) weight: no file, no offset, no bounds check. The data
+        // is resolved over RPC from the peer that owns the shard.
+        llama_tensor_weight(uint16_t idx, ggml_tensor * tensor, uint64_t hash)
+            : idx(idx), offs(0), tensor(tensor), is_stub_hash(true), stub_hash(hash) {}
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -167,6 +179,11 @@ struct llama_model_loader {
     std::string get_arch_name() const;
 
     enum llm_arch get_arch() const;
+
+    // TensorRelay model-part-stub (ADR-0014): inject the stripped (> HASH_THRESHOLD)
+    // tensors described in a .stub.gguf split's tensorrelay.stub.* KV arrays into
+    // weights_map as hash-backed weights. Returns the number injected.
+    size_t inject_stub_tensors(const struct gguf_context * stub_gguf, uint16_t idx);
 
     const llama_tensor_weight * get_weight(const char * name) const;
 

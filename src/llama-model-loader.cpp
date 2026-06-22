@@ -18,6 +18,32 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// TensorRelay model-part-stub support (ADR-0014). The RPC backend exposes a
+// "set tensor by precomputed hash" entry point via its registry get_proc_address,
+// so libllama can use it without a hard link to the optional RPC backend. A
+// non-null result for a buffer's registry also proves the buffer lives on an RPC
+// device (the placement invariant for stripped peer tensors).
+typedef bool (*tr_rpc_set_tensor_hash_t)(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint64_t hash, size_t offset);
+
+static tr_rpc_set_tensor_hash_t tr_rpc_set_tensor_hash_for_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return (tr_rpc_set_tensor_hash_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_set_tensor_hash");
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -646,6 +672,21 @@ llama_model_loader::llama_model_loader(
                     n_bytes    += ggml_nbytes(cur);
                     weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
                 }
+
+                // TensorRelay model-part-stub (ADR-0014): a ".stub.gguf" split only
+                // stores its small tensors on disk; its large tensors were stripped
+                // and described in tensorrelay.stub.* arrays. Re-materialize them as
+                // hash-backed weights so the unified tensor index is complete (and
+                // the split.tensors.count sanity check below passes). Their bytes are
+                // resolved over RPC from the peer that owns the shard at load time.
+                {
+                    const int64_t kid_stub = gguf_find_key(ctx_gguf.get(), "tensorrelay.stub");
+                    if (kid_stub >= 0 && gguf_get_val_bool(ctx_gguf.get(), kid_stub)) {
+                        const size_t n_injected = inject_stub_tensors(ctx_gguf.get(), idx);
+                        LLAMA_LOG_INFO("%s: model-part stub %s: injected %zu hash-backed tensor(s)\n",
+                                __func__, fname_split, n_injected);
+                    }
+                }
             }
 
             get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
@@ -822,6 +863,83 @@ std::string llama_model_loader::get_arch_name() const {
 
 enum llm_arch llama_model_loader::get_arch() const {
     return llm_kv.arch;
+}
+
+size_t llama_model_loader::inject_stub_tensors(const struct gguf_context * stub_gguf, uint16_t idx) {
+    const int64_t kid_names  = gguf_find_key(stub_gguf, "tensorrelay.stub.names");
+    const int64_t kid_types  = gguf_find_key(stub_gguf, "tensorrelay.stub.types");
+    const int64_t kid_shapes = gguf_find_key(stub_gguf, "tensorrelay.stub.shapes");
+    const int64_t kid_hashes = gguf_find_key(stub_gguf, "tensorrelay.stub.hashes");
+
+    if (kid_names < 0 || kid_types < 0 || kid_shapes < 0 || kid_hashes < 0) {
+        throw std::runtime_error("model-part stub is missing one or more tensorrelay.stub.* descriptor arrays");
+    }
+
+    const size_t n      = gguf_get_arr_n(stub_gguf, kid_names);
+    const size_t n_typ  = gguf_get_arr_n(stub_gguf, kid_types);
+    const size_t n_shp  = gguf_get_arr_n(stub_gguf, kid_shapes);
+    const size_t n_hsh  = gguf_get_arr_n(stub_gguf, kid_hashes);
+
+    if (n_typ != n || n_hsh != n || n_shp != n * 4) {
+        throw std::runtime_error(format(
+            "model-part stub descriptor arrays are inconsistent: names=%zu types=%zu shapes=%zu (expected %zu) hashes=%zu",
+            n, n_typ, n_shp, n * 4, n_hsh));
+    }
+
+    if (n == 0) {
+        return 0;
+    }
+
+    // The split's own ggml context is sized exactly for its real tensors, so the
+    // synthesized descriptors get a dedicated no_alloc context kept alive in
+    // `contexts`. These tensors carry metadata only; their bytes arrive via RPC.
+    struct ggml_init_params ip = {
+        /*.mem_size   =*/ (n + 1) * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * stub_ctx = ggml_init(ip);
+    if (stub_ctx == nullptr) {
+        throw std::runtime_error("failed to allocate context for model-part stub tensors");
+    }
+    contexts.emplace_back(stub_ctx);
+
+    const int32_t  * types  = (const int32_t  *) gguf_get_arr_data(stub_gguf, kid_types);
+    const int64_t  * shapes = (const int64_t  *) gguf_get_arr_data(stub_gguf, kid_shapes);
+    const uint64_t * hashes = (const uint64_t *) gguf_get_arr_data(stub_gguf, kid_hashes);
+
+    for (size_t i = 0; i < n; i++) {
+        const char * name = gguf_get_arr_str(stub_gguf, kid_names, i);
+
+        if (weights_map.find(name) != weights_map.end()) {
+            throw std::runtime_error(format("invalid model: stub tensor '%s' is duplicated", name));
+        }
+
+        int64_t ne[GGML_MAX_DIMS];
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            ne[d] = shapes[i * 4 + d];
+            if (ne[d] < 1) {
+                throw std::runtime_error(format("stub tensor '%s' has invalid dim %d = %" PRId64, name, d, ne[d]));
+            }
+        }
+        int n_dims = GGML_MAX_DIMS;
+        while (n_dims > 1 && ne[n_dims - 1] == 1) {
+            n_dims--;
+        }
+
+        const ggml_type type = (ggml_type) types[i];
+        ggml_tensor * t = ggml_new_tensor(stub_ctx, type, n_dims, ne);
+        if (t == nullptr) {
+            throw std::runtime_error(format("failed to create stub tensor '%s'", name));
+        }
+        ggml_set_name(t, name);
+
+        n_elements += ggml_nelements(t);
+        n_bytes    += ggml_nbytes(t);
+        weights_map.emplace(name, llama_tensor_weight(idx, t, hashes[i]));
+    }
+
+    return n;
 }
 
 const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
@@ -1366,6 +1484,11 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         if (!weight || weight->idx != idx) {
             continue;
         }
+        // Hash-backed stub tensors have no bytes in this file; their offs is a
+        // sentinel and must never widen the mmap range.
+        if (weight->is_stub_hash) {
+            continue;
+        }
         *first = std::min(*first, weight->offs);
         *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
     }
@@ -1373,6 +1496,13 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
+
+    if (w.is_stub_hash) {
+        // Legacy, non-ggml-backend path cannot satisfy a remote hash-backed tensor.
+        throw std::runtime_error(format(
+            "tensor '%s' is a model-part stub and cannot be loaded via the legacy path; "
+            "use load_all_data with the RPC backend", ggml_get_name(cur)));
+    }
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
@@ -1541,6 +1671,29 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (weight->is_stub_hash) {
+            // TensorRelay model-part-stub (ADR-0014): stage-0 holds no bytes for this
+            // peer tensor. It must live on a remote RPC device whose worker resolves
+            // the data from its own shard by FNV-1a hash. A non-RPC placement means
+            // the model-parts / tensor-split layout routed a peer tensor onto a local
+            // device, which can never be satisfied -> fail loud rather than load junk.
+            tr_rpc_set_tensor_hash_t set_hash = tr_rpc_set_tensor_hash_for_buffer(cur->buffer);
+            if (set_hash == nullptr) {
+                throw std::runtime_error(format(
+                    "tensor '%s' is a model-part stub but was not placed on a remote RPC device "
+                    "(check --tensor-split / device ordering, and that the RPC backend is loaded)",
+                    ggml_get_name(cur)));
+            }
+            if (!set_hash(cur->buffer, cur, weight->stub_hash, 0)) {
+                throw std::runtime_error(format(
+                    "tensor '%s': remote peer could not resolve stub hash %016" PRIx64
+                    " (worker shard mismatch or source_sha256 / version skew)",
+                    ggml_get_name(cur), weight->stub_hash));
+            }
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

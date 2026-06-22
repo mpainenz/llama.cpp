@@ -35,6 +35,15 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
+// TensorRelay model-part-stub fast path: bind a tensor that lives on a remote RPC
+// buffer to data the remote already holds, identified by a precomputed FNV-1a hash,
+// without transferring any bytes. Returns true iff the remote resolved the hash
+// (from its local GGUF tensor map or file cache) and set the tensor; false on a
+// cache miss, a non-RPC buffer, or a transport error. Stage-0 uses this to "load"
+// the stripped (> HASH_THRESHOLD) peer tensors it never downloaded: the hash comes
+// from the .stub.gguf and the peer that owns the shard resolves the bytes locally.
+GGML_BACKEND_API bool ggml_backend_rpc_buffer_set_tensor_hash(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint64_t hash, size_t offset);
+
 #ifdef __cplusplus
 }
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,

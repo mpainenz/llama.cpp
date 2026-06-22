@@ -660,6 +660,29 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     RPC_STATUS_ASSERT(status);
 }
 
+// TensorRelay model-part-stub fast path. The tensor lives on this remote RPC
+// buffer but stage-0 never downloaded its bytes; it only knows the FNV-1a hash
+// (published in the .stub.gguf). Ask the remote to resolve the hash from its own
+// shard / cache and bind the bytes to the tensor. No data crosses the wire.
+// Returns true only on a confirmed remote hit. This is exported (non-static) and
+// surfaced through ggml_backend_rpc_get_proc_address for the model loader.
+bool ggml_backend_rpc_buffer_set_tensor_hash(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint64_t hash, size_t offset) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_rpc(buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_msg_set_tensor_hash_req request;
+    request.tensor = serialize_tensor(tensor);
+    request.offset = offset;
+    request.hash   = hash;
+    rpc_msg_set_tensor_hash_rsp response;
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+    if (!status) {
+        return false;
+    }
+    return response.result != 0;
+}
+
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_get_tensor_req request;
@@ -2092,6 +2115,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_set_tensor_hash") == 0) {
+        return (void *)ggml_backend_rpc_buffer_set_tensor_hash;
     }
     return NULL;
 
