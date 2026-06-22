@@ -287,6 +287,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+static bool tr_is_rpc_dev(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg != nullptr && ggml_backend_reg_name(reg) == std::string("RPC");
+}
+
 struct llama_model::impl {
     impl() = default;
     ~impl() = default;
@@ -2630,6 +2635,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
     }
 
+    // TensorRelay model-part stubs (ADR-0014): split file 0 is stage-0's
+    // local shard; split files 1..N are peer shards and must be placed on the
+    // matching RPC device so stripped tensors can resolve by hash on the worker.
+    std::vector<ggml_backend_dev_t> rpc_devices;
+    for (auto * dev : devices) {
+        if (tr_is_rpc_dev(dev)) {
+            rpc_devices.push_back(dev);
+        }
+    }
+
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
@@ -2725,8 +2740,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+            const buft_list_t * buft_list_shard = nullptr;
+            const llama_model_loader::llama_tensor_weight * weight = ml.get_weight(tn.str().c_str());
+            if (weight != nullptr && weight->idx < ml.file_is_stub.size() && ml.file_is_stub[weight->idx]) {
+                const size_t rpc_idx = size_t(weight->idx - 1);
+                if (rpc_idx >= rpc_devices.size()) {
+                    throw std::runtime_error(format(
+                        "tensor '%s' belongs to model-part stub shard %u but only %zu RPC device(s) are available",
+                        tn.str().c_str(), unsigned(weight->idx), rpc_devices.size()));
+                }
+                auto it = pimpl->gpu_buft_list.find(rpc_devices[rpc_idx]);
+                if (it == pimpl->gpu_buft_list.end()) {
+                    throw std::runtime_error(format(
+                        "tensor '%s' belongs to model-part stub shard %u but RPC device %s has no buffer list",
+                        tn.str().c_str(), unsigned(weight->idx), ggml_backend_dev_name(rpc_devices[rpc_idx])));
+                }
+                buft_list_shard = &it->second;
+            }
             return ml.create_tensor(
-                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer, buft_list_shard,
                 tn, ne, flags);
         };
 

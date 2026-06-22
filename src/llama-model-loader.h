@@ -93,6 +93,7 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::vector<bool> file_is_stub;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -197,7 +198,7 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_shard, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 

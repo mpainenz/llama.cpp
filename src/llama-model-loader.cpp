@@ -577,6 +577,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_is_stub.push_back(false);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -659,6 +660,9 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                const int64_t kid_stub = gguf_find_key(ctx_gguf.get(), "tensorrelay.stub");
+                const bool is_stub = kid_stub >= 0 && gguf_get_val_bool(ctx_gguf.get(), kid_stub);
+                file_is_stub.push_back(is_stub);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -679,13 +683,10 @@ llama_model_loader::llama_model_loader(
                 // hash-backed weights so the unified tensor index is complete (and
                 // the split.tensors.count sanity check below passes). Their bytes are
                 // resolved over RPC from the peer that owns the shard at load time.
-                {
-                    const int64_t kid_stub = gguf_find_key(ctx_gguf.get(), "tensorrelay.stub");
-                    if (kid_stub >= 0 && gguf_get_val_bool(ctx_gguf.get(), kid_stub)) {
-                        const size_t n_injected = inject_stub_tensors(ctx_gguf.get(), idx);
-                        LLAMA_LOG_INFO("%s: model-part stub %s: injected %zu hash-backed tensor(s)\n",
-                                __func__, fname_split, n_injected);
-                    }
+                if (is_stub) {
+                    const size_t n_injected = inject_stub_tensors(ctx_gguf.get(), idx);
+                    LLAMA_LOG_INFO("%s: model-part stub %s: injected %zu hash-backed tensor(s)\n",
+                            __func__, fname_split, n_injected);
                 }
             }
 
@@ -718,6 +719,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_is_stub.push_back(false);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1160,7 +1162,7 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_shard, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1264,6 +1266,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 break;
             default:
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+        }
+        if (buft_list_shard != nullptr) {
+            buft_list = buft_list_shard;
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
