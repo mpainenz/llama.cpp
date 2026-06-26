@@ -1243,9 +1243,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // local shard; split files 1..N are peer shards and must be placed on the
     // matching RPC device so stripped tensors can resolve by hash on the worker.
     pimpl->rpc_devices.clear();
-    for (auto * dev : devices) {
-        if (tr_is_rpc_dev(dev)) {
-            pimpl->rpc_devices.push_back(dev);
+    for (const auto & dev : devices) {
+        if (tr_is_rpc_dev(dev.dev)) {
+            pimpl->rpc_devices.push_back(dev.dev);
         }
     }
 
