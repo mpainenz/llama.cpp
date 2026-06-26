@@ -19,8 +19,11 @@
 #include <vector>
 #include <unordered_set>
 
+#include "arg.h"
+#include "build-info.h"
 #include "common.h"
 #include "download.h"
+#include "fit.h"
 #include "ggml.h"
 #include "llama.h"
 
@@ -260,6 +263,8 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "layer";
         case LLAMA_SPLIT_MODE_ROW:
             return "row";
+        case LLAMA_SPLIT_MODE_TENSOR:
+            return "tensor";
         default:
             GGML_ABORT("invalid split mode");
     }
@@ -271,9 +276,11 @@ static std::string pair_str(const std::pair<int, int> & p) {
     return buf;
 }
 
-static std::vector<int> parse_int_range(const std::string & s) {
+static std::vector<int> parse_int_range(const std::string & s, bool allow_negative = false) {
     // first[-last[(+|*)step]]
-    std::regex range_regex(R"(^(\d+)(?:-(\d+)(?:([\+|\*])(\d+))?)?(?:,|$))");
+    std::regex range_regex(allow_negative
+        ? R"(^(-?\d+)(?:-(\d+)(?:([\+|\*])(\d+))?)?(?:,|$))"
+        : R"(^(\d+)(?:-(\d+)(?:([\+|\*])(\d+))?)?(?:,|$))");
 
     std::smatch match;
     std::string::const_iterator search_start(s.cbegin());
@@ -316,6 +323,7 @@ struct cmd_params {
     std::vector<std::string>         hf_repo;
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
+    bool                             offline;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -333,7 +341,7 @@ struct cmd_params {
     std::vector<llama_split_mode>    split_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
-    std::vector<bool>                flash_attn;
+    std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
@@ -342,6 +350,8 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
+    std::vector<size_t>              fit_params_target;
+    std::vector<uint32_t>            fit_params_min_ctx;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -358,6 +368,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_repo              */ {},
     /* hf_file              */ {},
     /* hf_token             */ "",
+    /* offline              */ false,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -366,16 +377,16 @@ static const cmd_params cmd_params_defaults = {
     /* n_ubatch             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
-    /* n_threads            */ { cpu_get_num_math() },
+    /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
-    /* n_gpu_layers         */ { 99 },
+    /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
-    /* flash_attn           */ { false },
+    /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
@@ -384,6 +395,8 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
+    /* fit_params_target    */ { 0 },
+    /* fit_params_min_ctx   */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -410,6 +423,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
+    printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -424,6 +439,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                              (default: unused)\n");
     printf("  -hft, --hf-token <token>                    Hugging Face access token\n");
     printf("                                              (default: value from HF_TOKEN environment variable)\n");
+    printf("  --offline                                   Offline mode: forces use of cache, prevents network access\n");
+    printf("                                              (default: disabled)\n");
     printf("  -p, --n-prompt <n>                          (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                             (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
     printf("  -pg <pp,tg>                                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
@@ -438,10 +455,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row>          (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
-    printf("  -fa, --flash-attn <0|1>                     (default: %s)\n", join(cmd_params_defaults.flash_attn, ",").c_str());
+    printf("  -fa, --flash-attn <on|off|auto>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
@@ -545,6 +562,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.hf_token = argv[i];
+            } else if (arg == "--offline") {
+                params.offline = true;
             } else if (arg == "-p" || arg == "--n-prompt") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -700,7 +719,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto p = parse_int_range(argv[i]);
+                auto p = parse_int_range(argv[i], /*allow_negative=*/true);
                 params.n_gpu_layers.insert(params.n_gpu_layers.end(), p.begin(), p.end());
             } else if (arg == "-ncmoe" || arg == "--n-cpu-moe") {
                 if (++i >= argc) {
@@ -737,6 +756,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_LAYER;
                     } else if (m == "row") {
                         mode = LLAMA_SPLIT_MODE_ROW;
+                    } else if (m == "tensor") {
+                        mode = LLAMA_SPLIT_MODE_TENSOR;
                     } else {
                         invalid_param = true;
                         break;
@@ -781,8 +802,27 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto p = string_split<bool>(argv[i], split_delim);
-                params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<llama_flash_attn_type> types;
+                for (const auto & v : p) {
+                    llama_flash_attn_type type;
+                    if (common_arg_utils::is_truthy(v)) {
+                        type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                    } else if (common_arg_utils::is_falsey(v)) {
+                        type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                    } else if (common_arg_utils::is_autoy(v)) {
+                        type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                    types.push_back(type);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.flash_attn.insert(params.flash_attn.end(), types.begin(), types.end());
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -958,6 +998,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "-fitt" || arg == "--fit-target") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.fit_params_target.push_back(std::stoull(v));
+                }
+            } else if (arg == "-fitc" || arg == "--fit-ctx") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.fit_params_min_ctx.push_back(std::stoul(v));
+                }
             } else {
                 invalid_param = true;
                 break;
@@ -977,22 +1035,23 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
     if (!params.hf_repo.empty()) {
         for (size_t i = 0; i < params.hf_repo.size(); i++) {
-            common_params_model model;
-
-            if (params.hf_file.empty() || params.hf_file[i].empty()) {
-                model.hf_repo = params.hf_repo[i];
-            } else {
-                model.hf_repo = params.hf_repo[i];
-                model.hf_file = params.hf_file[i];
+            common_params p;
+            p.hf_token      = params.hf_token;
+            p.offline       = params.offline;
+            p.model.hf_repo = params.hf_repo[i];
+            if (!params.hf_file.empty() && !params.hf_file[i].empty()) {
+                p.model.hf_file = params.hf_file[i];
             }
 
-            auto download_result = common_download_model(model, params.hf_token);
-            if (download_result.model_path.empty()) {
+            // only the text model file is needed
+            common_models_handler models_handler = common_models_handler_init(p, LLAMA_EXAMPLE_BENCH);
+            common_models_handler_apply(models_handler, p);
+            if (p.model.path.empty()) {
                 fprintf(stderr, "error: failed to download model from HuggingFace\n");
                 exit(1);
             }
 
-            params.model.push_back(download_result.model_path);
+            params.model.push_back(p.model.path);
         }
     }
 
@@ -1078,6 +1137,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.poll.empty()) {
         params.poll = cmd_params_defaults.poll;
     }
+    if (params.fit_params_target.empty()) {
+        params.fit_params_target = cmd_params_defaults.fit_params_target;
+    }
+    if (params.fit_params_min_ctx.empty()) {
+        params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
+    }
 
     return params;
 }
@@ -1100,7 +1165,7 @@ struct cmd_params_instance {
     llama_split_mode   split_mode;
     int                main_gpu;
     bool               no_kv_offload;
-    bool               flash_attn;
+    llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1109,6 +1174,8 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    size_t             fit_target;
+    uint32_t           fit_min_ctx;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1182,7 +1249,7 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
-        cparams.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
@@ -1197,6 +1264,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
     for (const auto & m : params.model)
+    for (const auto & fpt : params.fit_params_target)
+    for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & sm : params.split_mode)
@@ -1251,6 +1320,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .fit_target   = */ fpt,
+                /* .fit_min_ctx  = */ fpc,
             };
             instances.push_back(instance);
         }
@@ -1286,6 +1357,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .fit_target   = */ fpt,
+                /* .fit_min_ctx  = */ fpc,
             };
             instances.push_back(instance);
         }
@@ -1321,6 +1394,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .fit_target   = */ fpt,
+                /* .fit_min_ctx  = */ fpc,
             };
             instances.push_back(instance);
         }
@@ -1352,7 +1427,7 @@ struct test {
     llama_split_mode         split_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
-    bool                     flash_attn;
+    llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1361,6 +1436,8 @@ struct test {
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
+    size_t                   fit_target;
+    uint32_t                 fit_min_ctx;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1399,6 +1476,8 @@ struct test {
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
+        fit_target     = inst.fit_target;
+        fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1456,7 +1535,8 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
-            "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
+            "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
+            "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1468,10 +1548,11 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
-            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
+            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
@@ -1540,7 +1621,7 @@ struct test {
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
-                                            std::to_string(flash_attn),
+                                            std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
@@ -1549,6 +1630,8 @@ struct test {
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
+                                            std::to_string(fit_target),
+                                            std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
@@ -1570,8 +1653,8 @@ struct test {
     }
 };
 
-const std::string test::build_commit = LLAMA_COMMIT;
-const int         test::build_number = LLAMA_BUILD_NUMBER;
+const std::string test::build_commit = llama_commit();
+const int         test::build_number = llama_build_number();
 
 struct printer {
     virtual ~printer() {}
@@ -1720,10 +1803,10 @@ struct markdown_printer : public printer {
             return 6;
         }
         if (field == "split_mode") {
-            return 5;
+            return 6;
         }
         if (field == "flash_attn") {
-            return 2;
+            return 3;
         }
         if (field == "devices") {
             return -12;
@@ -1791,6 +1874,12 @@ struct markdown_printer : public printer {
         }
         if (field == "tensor_buft_overrides") {
             return "ot";
+        }
+        if (field == "fit_target") {
+            return "fitt";
+        }
+        if (field == "fit_min_ctx") {
+            return "fitc";
         }
         return field;
     }
@@ -1869,6 +1958,12 @@ struct markdown_printer : public printer {
         }
         if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");
+        }
+        if (params.fit_params_target.size() > 1 || params.fit_params_target != cmd_params_defaults.fit_params_target) {
+            fields.emplace_back("fit_target");
+        }
+        if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
+            fields.emplace_back("fit_min_ctx");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
@@ -2068,7 +2163,10 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("fatal error");
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_bench(int argc, char ** argv);
+
+int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
     std::setlocale(LC_CTYPE, ".UTF-8");
@@ -2141,13 +2239,49 @@ int main(int argc, char ** argv) {
         if (params.progress) {
             fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
         }
+        auto mparams = inst.to_llama_mparams();
+        auto cparams = inst.to_llama_cparams();
+
+        bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
+                      inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
+
+        std::vector<float> fit_tensor_split(llama_max_devices(), 0.0f);
+        std::vector<llama_model_tensor_buft_override> fit_overrides(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
+
+        if (do_fit) {
+            // free the previous model so fit sees full free VRAM
+            if (lmodel) {
+                llama_model_free(lmodel);
+                lmodel    = nullptr;
+                prev_inst = nullptr;
+            }
+
+            // use default n_gpu_layers and n_ctx so common_fit_params can adjust them
+            mparams.n_gpu_layers          = llama_model_default_params().n_gpu_layers;
+            mparams.tensor_split          = fit_tensor_split.data();
+            mparams.tensor_buft_overrides = fit_overrides.data();
+            cparams.n_ctx                 = 0;
+
+            std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
+
+            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
+            cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+
+            common_fit_params(inst.model.c_str(), &mparams, &cparams,
+                fit_tensor_split.data(),
+                fit_overrides.data(),
+                margins.data(),
+                inst.fit_min_ctx,
+                params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+       }
+
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {
                 llama_model_free(lmodel);
             }
 
-            lmodel = llama_model_load_from_file(inst.model.c_str(), inst.to_llama_mparams());
+            lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
@@ -2155,7 +2289,7 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
+        llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
