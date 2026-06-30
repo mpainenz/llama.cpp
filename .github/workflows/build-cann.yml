@@ -34,6 +34,13 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  cann-disabled:
+    name: CANN build disabled
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report disabled build
+        run: echo "CANN build is disabled until dedicated runners are provisioned."
+
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
 #  openEuler-latest-cann:
