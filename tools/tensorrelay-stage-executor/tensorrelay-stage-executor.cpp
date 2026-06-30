@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -16,11 +17,16 @@
 using json = nlohmann::ordered_json;
 
 struct tr_stage_metadata {
+    bool        has_tensorrelay_stage_metadata = false;
+    bool        has_legacy_split_metadata = false;
+    bool        has_architecture = false;
     bool        stage_marker = false;
     uint32_t    stage_index = 0;
     uint32_t    stage_count = 0;
     uint32_t    first_layer = 0;
     uint32_t    last_layer_exclusive = 0;
+    uint32_t    legacy_split_no = 0;
+    uint32_t    legacy_split_count = 0;
     int64_t     tensor_count = 0;
     std::string architecture;
 };
@@ -78,18 +84,81 @@ static bool gguf_bool(const gguf_context * ctx, const char * key, bool & out, st
     return true;
 }
 
+static bool read_gguf_u32_value(const gguf_context * ctx, int64_t id, uint32_t & out) {
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:
+            out = gguf_get_val_u8(ctx, id);
+            return true;
+        case GGUF_TYPE_UINT16:
+            out = gguf_get_val_u16(ctx, id);
+            return true;
+        case GGUF_TYPE_UINT32:
+            out = gguf_get_val_u32(ctx, id);
+            return true;
+        case GGUF_TYPE_UINT64: {
+            const uint64_t value = gguf_get_val_u64(ctx, id);
+            if (value > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            out = static_cast<uint32_t>(value);
+            return true;
+        }
+        case GGUF_TYPE_INT8: {
+            const int8_t value = gguf_get_val_i8(ctx, id);
+            if (value < 0) {
+                return false;
+            }
+            out = static_cast<uint32_t>(value);
+            return true;
+        }
+        case GGUF_TYPE_INT16: {
+            const int16_t value = gguf_get_val_i16(ctx, id);
+            if (value < 0) {
+                return false;
+            }
+            out = static_cast<uint32_t>(value);
+            return true;
+        }
+        case GGUF_TYPE_INT32: {
+            const int32_t value = gguf_get_val_i32(ctx, id);
+            if (value < 0) {
+                return false;
+            }
+            out = static_cast<uint32_t>(value);
+            return true;
+        }
+        case GGUF_TYPE_INT64: {
+            const int64_t value = gguf_get_val_i64(ctx, id);
+            if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            out = static_cast<uint32_t>(value);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 static bool gguf_u32(const gguf_context * ctx, const char * key, uint32_t & out, std::string & error) {
     const int64_t id = gguf_find_key(ctx, key);
     if (id < 0) {
         error = std::string("missing GGUF metadata key: ") + key;
         return false;
     }
-    if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_UINT32) {
+    if (!read_gguf_u32_value(ctx, id, out)) {
         error = std::string("GGUF metadata key has wrong type: ") + key;
         return false;
     }
-    out = gguf_get_val_u32(ctx, id);
     return true;
+}
+
+static bool gguf_optional_u32(const gguf_context * ctx, const char * key, uint32_t & out) {
+    const int64_t id = gguf_find_key(ctx, key);
+    if (id < 0) {
+        return false;
+    }
+    return read_gguf_u32_value(ctx, id, out);
 }
 
 static bool gguf_string(const gguf_context * ctx, const char * key, std::string & out, std::string & error) {
@@ -136,15 +205,30 @@ static bool read_stage_metadata(const std::string & shard_path, tr_stage_metadat
         error = "failed to read GGUF metadata from stage shard: " + shard_path;
         return false;
     }
+    out.has_architecture = gguf_find_key(ctx.get(), "general.architecture") >= 0;
+    if (out.has_architecture && !gguf_string(ctx.get(), "general.architecture", out.architecture, error)) {
+        return false;
+    }
+    out.tensor_count = gguf_get_n_tensors(ctx.get());
+    out.first_layer = 0;
+    out.last_layer_exclusive = std::numeric_limits<uint32_t>::max();
+    if (gguf_optional_u32(ctx.get(), "split.count", out.legacy_split_count)) {
+        out.has_legacy_split_metadata = true;
+        gguf_optional_u32(ctx.get(), "split.no", out.legacy_split_no);
+    }
+
+    out.has_tensorrelay_stage_metadata = gguf_find_key(ctx.get(), "tensorrelay.stage") >= 0;
+    if (!out.has_tensorrelay_stage_metadata) {
+        return true;
+    }
+
     if (!gguf_bool(ctx.get(), "tensorrelay.stage", out.stage_marker, error) ||
         !gguf_u32(ctx.get(), "tensorrelay.stage.index", out.stage_index, error) ||
         !gguf_u32(ctx.get(), "tensorrelay.stage.count", out.stage_count, error) ||
         !gguf_u32(ctx.get(), "tensorrelay.stage.first_layer", out.first_layer, error) ||
-        !gguf_u32(ctx.get(), "tensorrelay.stage.last_layer_exclusive", out.last_layer_exclusive, error) ||
-        !gguf_string(ctx.get(), "general.architecture", out.architecture, error)) {
+        !gguf_u32(ctx.get(), "tensorrelay.stage.last_layer_exclusive", out.last_layer_exclusive, error)) {
         return false;
     }
-    out.tensor_count = gguf_get_n_tensors(ctx.get());
     return true;
 }
 
@@ -152,6 +236,43 @@ static bool validate_stage_metadata(
         const tr_stage_metadata & meta,
         const tr_stage_executor_load_params * params,
         std::string & error) {
+    if (meta.tensor_count <= 0) {
+        error = "GGUF artifact contains no tensors";
+        return false;
+    }
+
+    if (!meta.has_tensorrelay_stage_metadata) {
+        if (meta.has_legacy_split_metadata) {
+            error = "GGUF artifact is a legacy llama.cpp tensor-split shard without TensorRelay layer-stage metadata"
+                " (split.no=" + std::to_string(meta.legacy_split_no) +
+                " split.count=" + std::to_string(meta.legacy_split_count) +
+                "); custom multi-node inference requires TensorRelay layer-stage GGUF artifacts";
+            return false;
+        }
+        if (params->split_count == 1 && params->stage_index == 0) {
+            if (!meta.has_architecture) {
+                error = "missing GGUF metadata key: general.architecture";
+                return false;
+            }
+            if (!is_supported_architecture(meta.architecture)) {
+                error = "unsupported TensorRelay stage architecture: " + meta.architecture;
+                return false;
+            }
+            return true;
+        }
+        error = "GGUF artifact is missing TensorRelay layer-stage metadata; custom multi-node inference requires"
+                " TensorRelay layer-stage GGUF artifacts";
+        return false;
+    }
+
+    if (!meta.has_architecture) {
+        error = "missing GGUF metadata key: general.architecture";
+        return false;
+    }
+    if (!is_supported_architecture(meta.architecture)) {
+        error = "unsupported TensorRelay stage architecture: " + meta.architecture;
+        return false;
+    }
     if (!meta.stage_marker) {
         error = "GGUF artifact is not marked as a TensorRelay layer-stage shard";
         return false;
@@ -166,14 +287,6 @@ static bool validate_stage_metadata(
     }
     if (meta.first_layer >= meta.last_layer_exclusive) {
         error = "GGUF stage layer range is empty or invalid";
-        return false;
-    }
-    if (meta.tensor_count <= 0) {
-        error = "GGUF stage shard contains no tensors";
-        return false;
-    }
-    if (!is_supported_architecture(meta.architecture)) {
-        error = "unsupported TensorRelay stage architecture: " + meta.architecture;
         return false;
     }
     return true;
