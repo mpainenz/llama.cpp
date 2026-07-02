@@ -145,6 +145,16 @@ jobs:
           Copy-Item "$cudaBin\cublas64_*.dll" dist\ -ErrorAction SilentlyContinue
           Copy-Item "$cudaBin\cublasLt64_*.dll" dist\ -ErrorAction SilentlyContinue
           Copy-Item "$cudaBin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
+          # Bundle the MSVC CRT redistributables: consumer machines without the
+          # VC redist otherwise fail LoadLibrary with error 126 on a transitive
+          # dependency (the same failure class as the MinGW libgomp incident).
+          $crt = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($crt) {
+            Copy-Item "$($crt.FullName)\vcruntime140.dll" dist\ -ErrorAction SilentlyContinue
+            Copy-Item "$($crt.FullName)\vcruntime140_1.dll" dist\ -ErrorAction SilentlyContinue
+            Copy-Item "$($crt.FullName)\msvcp140.dll" dist\ -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path dist\vcruntime140.dll)) { Write-Error "MSVC CRT redist DLLs not found on runner" }
           Copy-Item LICENSE dist\
           Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
           if (-not (Test-Path dist\tensorrelay_stage_executor.dll)) { Write-Error "stage executor dll missing" }
