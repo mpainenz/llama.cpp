@@ -77,7 +77,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // TensorRelay: non-final stages emit embeddings for every token and never
+    // gather output rows, so building the out_ids input would leave it without
+    // a consumer (and therefore without an allocated buffer) in the graph.
+    ggml_tensor * inp_out_ids = model.tensorrelay_stage_is_final() ? build_inp_out_ids() : nullptr;
 
     for (int il = first_layer; il < last_layer; ++il) {
         res->t_layer_inp[il] = inpL;

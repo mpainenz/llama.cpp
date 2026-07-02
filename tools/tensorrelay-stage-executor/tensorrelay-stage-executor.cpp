@@ -692,7 +692,11 @@ struct split_batch_storage {
 
             if (is_final_stage) {
                 logits[cursor + input.token_count - 1] = 1;
-                output_ordinals.push_back(output_ordinal++);
+                // llama_get_logits_ith() takes a batch token index (translated
+                // through output_ids), not an output ordinal: record the index
+                // of each input's sampled (last) token.
+                output_ordinals.push_back(static_cast<uint32_t>(cursor + input.token_count - 1));
+                output_ordinal++;
             } else {
                 for (uint32_t j = 0; j < input.token_count; ++j) {
                     logits[cursor + j] = 1;
