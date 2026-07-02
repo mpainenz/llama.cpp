@@ -1846,6 +1846,63 @@ int32_t tr_stage_executor_benchmark(
     return TENSORRELAY_STAGE_EXECUTOR_OK;
 }
 
+// ABI v7: enumerate the ggml GPU/iGPU devices loadable in this process right
+// now (see header contract). Requires only a created handle, not a loaded
+// stage, so a supervisor can probe real device availability up front.
+int32_t tr_stage_executor_enumerate_devices(
+        void * handle,
+        uint8_t * out_ptr,
+        size_t out_cap,
+        size_t * out_len) {
+    auto * state = as_state(handle);
+    if (state == nullptr || out_len == nullptr) {
+        return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
+    }
+    *out_len = 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    std::call_once(backend_init_once, []() {
+        llama_backend_init();
+        ggml_backend_load_all();
+    });
+
+    json devices = json::array();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * name = ggml_backend_dev_name(dev);
+        const char * backend_name = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+        const char * description = ggml_backend_dev_description(dev);
+        const uint64_t max_mb = std::numeric_limits<uint32_t>::max();
+        devices.push_back(json{
+            { "name", name == nullptr ? "" : name },
+            { "backend", backend_name == nullptr ? "" : backend_name },
+            { "description", description == nullptr ? "" : description },
+            { "memory_total_mb", std::min<uint64_t>(total_bytes / (1024u * 1024u), max_mb) },
+            { "memory_free_mb", std::min<uint64_t>(free_bytes / (1024u * 1024u), max_mb) },
+        });
+    }
+    const std::string payload = devices.dump();
+    *out_len = payload.size();
+    if (out_ptr == nullptr || out_cap == 0) {
+        // probe call: report the required capacity only
+        state->last_error.clear();
+        return TENSORRELAY_STAGE_EXECUTOR_OK;
+    }
+    if (out_cap < payload.size()) {
+        return set_error(state, "device enumeration buffer is too small", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    std::memcpy(out_ptr, payload.data(), payload.size());
+    state->last_error.clear();
+    return TENSORRELAY_STAGE_EXECUTOR_OK;
+}
+
 // ABI v5: install the per-(slot, request epoch) sampler chain used by
 // final-stage sampling. Reservation-time call; replaces any previous chain.
 int32_t tr_stage_executor_configure_slot_sampler(

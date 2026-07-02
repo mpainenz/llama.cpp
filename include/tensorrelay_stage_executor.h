@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 6u
+#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 7u
 #define TENSORRELAY_STAGE_EXECUTOR_OK 0
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT -1
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED -2
@@ -154,6 +154,18 @@ TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_benchmark(
     void * handle,
     uint32_t steps,
     tr_stage_executor_benchmark_result * out);
+// ABI v7: enumerates the ggml backend devices that are actually loadable in
+// this process right now (after ggml_backend_load_all). Works on a freshly
+// created executor before any load. Writes a UTF-8 JSON array of
+// {name, backend, description, memory_total_mb, memory_free_mb} objects, one
+// per GPU/iGPU device (CPU and accelerator devices are omitted). Two-call
+// pattern: with out_ptr NULL or out_cap 0 only *out_len is set to the
+// required byte count; otherwise the JSON is copied when it fits.
+TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_enumerate_devices(
+    void * handle,
+    uint8_t * out_ptr,
+    size_t out_cap,
+    size_t * out_len);
 TENSORRELAY_STAGE_EXECUTOR_API size_t   tr_stage_executor_last_error(void * handle, uint8_t * out_ptr, size_t out_len);
 
 #ifdef __cplusplus
