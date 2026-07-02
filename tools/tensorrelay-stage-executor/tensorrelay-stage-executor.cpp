@@ -6,6 +6,8 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -31,6 +33,25 @@ struct tr_stage_metadata {
     uint32_t    legacy_split_count = 0;
     int64_t     tensor_count = 0;
     std::string architecture;
+
+    // Architecture layout metadata used by the per-model split soundness checks.
+    uint32_t    block_count = 0;        // <arch>.block_count (includes NextN/MTP tail blocks)
+    uint32_t    nextn_layers = 0;       // <arch>.nextn_predict_layers (0 when absent)
+    // gemma4
+    uint32_t    per_layer_embd = 0;     // <arch>.embedding_length_per_layer_input
+    uint32_t    shared_kv_layers = 0;   // <arch>.attention.shared_kv_layers
+    std::vector<bool> swa_layers;       // gemma4: per-layer sliding-window flags
+    // qwen35 / qwen35moe
+    std::vector<bool> recurrent_layers; // per-layer linear-attention (gated delta net) flags
+};
+
+// Per-slot sampler chain installed via tr_stage_executor_configure_slot_sampler.
+// The chain persists across sampling steps of one (slot, request epoch) so
+// stateful samplers (dist RNG) advance correctly over a generation.
+struct tr_slot_sampler_state {
+    uint64_t        request_epoch = 0;
+    bool            configured = false;
+    llama_sampler * sampler = nullptr;
 };
 
 struct tr_stage_executor_state {
@@ -38,16 +59,23 @@ struct tr_stage_executor_state {
     std::string shard_path;
     std::string selected_devices;
     std::string architecture;
+    // Non-empty when the architecture is split-capable in general but this
+    // specific model/stage layout cannot be executed with hidden-state-only
+    // boundaries (e.g. gemma4 per-layer embeddings or split KV-shared layers).
+    std::string split_unsound_reason;
     int32_t     stage_index = -1;
     int32_t     split_count = 0;
     uint32_t    first_layer = 0;
     uint32_t    last_layer_exclusive = 0;
     uint32_t    hidden_dim = 0;
+    uint32_t    block_count = 0;
     uint32_t    slot_count = 0;
     uint32_t    context_length = 0;
+    uint32_t    pos_streams = 1;
     bool        loaded = false;
     std::vector<std::string> device_names;
     std::vector<uint64_t> slot_epochs;
+    std::vector<tr_slot_sampler_state> slot_samplers;
     std::mutex  mutex;
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -165,6 +193,72 @@ static bool gguf_optional_u32(const gguf_context * ctx, const char * key, uint32
     return read_gguf_u32_value(ctx, id, out);
 }
 
+// Reads a per-layer boolean layer-type pattern that converters store either as
+// a scalar (broadcast to every layer) or as an array of bool/int values.
+// Returns false when the key is absent or has an unusable type.
+static bool gguf_optional_layer_flags(
+        const gguf_context * ctx,
+        const char * key,
+        uint32_t n_layer,
+        std::vector<bool> & out) {
+    const int64_t id = gguf_find_key(ctx, key);
+    if (id < 0 || n_layer == 0) {
+        return false;
+    }
+    const gguf_type type = gguf_get_kv_type(ctx, id);
+    if (type == GGUF_TYPE_BOOL) {
+        out.assign(n_layer, gguf_get_val_bool(ctx, id));
+        return true;
+    }
+    if (type != GGUF_TYPE_ARRAY) {
+        uint32_t value = 0;
+        if (!read_gguf_u32_value(ctx, id, value)) {
+            return false;
+        }
+        out.assign(n_layer, value != 0);
+        return true;
+    }
+    const size_t n = gguf_get_arr_n(ctx, id);
+    if (n == 0) {
+        return false;
+    }
+    const gguf_type elem = gguf_get_arr_type(ctx, id);
+    const void * data = gguf_get_arr_data(ctx, id);
+    if (data == nullptr) {
+        return false;
+    }
+    out.assign(n_layer, false);
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const size_t src = std::min<size_t>(il, n - 1);
+        switch (elem) {
+            case GGUF_TYPE_BOOL:
+                out[il] = static_cast<const int8_t *>(data)[src] != 0;
+                break;
+            case GGUF_TYPE_INT8:
+                out[il] = static_cast<const int8_t *>(data)[src] != 0;
+                break;
+            case GGUF_TYPE_UINT8:
+                out[il] = static_cast<const uint8_t *>(data)[src] != 0;
+                break;
+            case GGUF_TYPE_INT16:
+                out[il] = static_cast<const int16_t *>(data)[src] != 0;
+                break;
+            case GGUF_TYPE_UINT16:
+                out[il] = static_cast<const uint16_t *>(data)[src] != 0;
+                break;
+            case GGUF_TYPE_INT32:
+                out[il] = static_cast<const int32_t *>(data)[src] != 0;
+                break;
+            case GGUF_TYPE_UINT32:
+                out[il] = static_cast<const uint32_t *>(data)[src] != 0;
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool gguf_string(const gguf_context * ctx, const char * key, std::string & out, std::string & error) {
     const int64_t id = gguf_find_key(ctx, key);
     if (id < 0) {
@@ -198,12 +292,22 @@ static bool is_supported_architecture(const std::string & architecture) {
     return supported.find(architecture) != supported.end();
 }
 
+// Architectures whose graph builders support TensorRelay layer-stage execution
+// (hidden-state-only stage boundaries). qwen35/qwen35moe carry per-layer
+// recurrent (gated delta net) state and gemma4 carries per-layer iSWA KV state,
+// but both keep that state strictly layer-local, so it stays inside the stage
+// that owns the layer. Some gemma4 configurations are still unsound to split
+// (per-layer token embeddings, split KV-shared tails); those are rejected
+// per-model by split_stage_unsound_reason() below.
 static bool is_split_graph_execution_architecture(const std::string & architecture) {
     static const std::set<std::string> supported = {
         "qwen2",
         "qwen2moe",
         "qwen3",
         "qwen3moe",
+        "qwen35",
+        "qwen35moe",
+        "gemma4",
     };
     return supported.find(architecture) != supported.end();
 }
@@ -225,8 +329,33 @@ static bool read_stage_metadata(const std::string & shard_path, tr_stage_metadat
     }
     out.hidden_dim = 0;
     if (out.has_architecture) {
-        const std::string hidden_dim_key = out.architecture + ".embedding_length";
-        gguf_optional_u32(ctx.get(), hidden_dim_key.c_str(), out.hidden_dim);
+        const std::string arch = out.architecture;
+        gguf_optional_u32(ctx.get(), (arch + ".embedding_length").c_str(), out.hidden_dim);
+        gguf_optional_u32(ctx.get(), (arch + ".block_count").c_str(), out.block_count);
+        gguf_optional_u32(ctx.get(), (arch + ".nextn_predict_layers").c_str(), out.nextn_layers);
+        // main-pass layer count (NextN/MTP tail blocks are not executed by the executor)
+        const uint32_t n_layer = out.block_count > out.nextn_layers ? out.block_count - out.nextn_layers : 0;
+        if (arch == "gemma4") {
+            gguf_optional_u32(ctx.get(), (arch + ".embedding_length_per_layer_input").c_str(), out.per_layer_embd);
+            gguf_optional_u32(ctx.get(), (arch + ".attention.shared_kv_layers").c_str(), out.shared_kv_layers);
+            gguf_optional_layer_flags(
+                ctx.get(), (arch + ".attention.sliding_window_pattern").c_str(), n_layer, out.swa_layers);
+        }
+        if (arch == "qwen35" || arch == "qwen35moe") {
+            if (!gguf_optional_layer_flags(
+                    ctx.get(), (arch + ".attention.recurrent_layers").c_str(), n_layer, out.recurrent_layers)) {
+                // default layout used by llama.cpp when the explicit array is absent:
+                // every layer is linear attention except each full_attention_interval-th
+                uint32_t full_attn_interval = 4;
+                gguf_optional_u32(ctx.get(), (arch + ".full_attention_interval").c_str(), full_attn_interval);
+                if (full_attn_interval > 0 && n_layer > 0) {
+                    out.recurrent_layers.assign(n_layer, false);
+                    for (uint32_t il = 0; il < n_layer; ++il) {
+                        out.recurrent_layers[il] = (il + 1) % full_attn_interval != 0;
+                    }
+                }
+            }
+        }
     }
     out.tensor_count = gguf_get_n_tensors(ctx.get());
     out.first_layer = 0;
@@ -249,6 +378,76 @@ static bool read_stage_metadata(const std::string & shard_path, tr_stage_metadat
         return false;
     }
     return true;
+}
+
+// Per-model split soundness check for architectures whose graphs are only
+// splittable at hidden-state-only boundaries under extra layout constraints.
+// Returns a non-empty human-readable reason when THIS stage cannot soundly run
+// native split graph execution; empty string means the stage layout is sound.
+static std::string split_stage_unsound_reason(const tr_stage_metadata & meta) {
+    const uint32_t n_layer = meta.block_count > meta.nextn_layers ? meta.block_count - meta.nextn_layers : 0;
+    const uint32_t first = meta.first_layer;
+    const uint32_t last = std::min(meta.last_layer_exclusive, n_layer);
+
+    if (n_layer == 0 || first >= last) {
+        return "stage layer range contains no executable (non-NextN) layers";
+    }
+
+    if (meta.architecture == "gemma4") {
+        if (meta.per_layer_embd != 0) {
+            return "gemma4 per-layer token embeddings require the token ids and the layer-0 input"
+                   " embedding at every layer, which do not cross hidden-state-only stage boundaries";
+        }
+        if (meta.shared_kv_layers > 0 && meta.shared_kv_layers < n_layer) {
+            // Shared tail layers reuse the K/V written by the last two KV-owning
+            // layers (n_layer_kv_from_start - 1 and - 2); a stage that executes a
+            // shared layer must also execute both of its KV source layers.
+            const uint32_t kv_from_start = n_layer - meta.shared_kv_layers;
+            if (last > kv_from_start && (kv_from_start < 2 || first > kv_from_start - 2)) {
+                return "gemma4 stage layer range separates KV-shared layers from the source layers"
+                       " whose K/V they reuse";
+            }
+        }
+        // The iSWA graph always builds both the sliding-window and the full
+        // attention mask inputs; a stage lacking one layer kind would leave the
+        // other mask without a consumer (and without an allocated buffer).
+        if (!meta.swa_layers.empty()) {
+            bool has_swa = false;
+            bool has_full = false;
+            for (uint32_t il = first; il < last; ++il) {
+                (meta.swa_layers[il] ? has_swa : has_full) = true;
+            }
+            bool model_has_swa = false;
+            bool model_has_full = false;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                (meta.swa_layers[il] ? model_has_swa : model_has_full) = true;
+            }
+            if ((model_has_swa && !has_swa) || (model_has_full && !has_full)) {
+                return "gemma4 stage layer range must contain at least one sliding-window and one"
+                       " full-attention layer so that both attention mask inputs stay consumed";
+            }
+        }
+    }
+
+    if (meta.architecture == "qwen35" || meta.architecture == "qwen35moe") {
+        // The hybrid graph always builds both the recurrent-state and the
+        // attention KV inputs; a stage lacking one layer kind would leave the
+        // other input without a consumer (and without an allocated buffer).
+        if (meta.recurrent_layers.empty()) {
+            return "qwen35 stage metadata is missing the recurrent layer layout";
+        }
+        bool has_recr = false;
+        bool has_attn = false;
+        for (uint32_t il = first; il < last; ++il) {
+            (meta.recurrent_layers[il] ? has_recr : has_attn) = true;
+        }
+        if (!has_recr || !has_attn) {
+            return "qwen35 stage layer range must contain at least one linear-attention and one"
+                   " full-attention layer so that both hybrid memory inputs stay consumed";
+        }
+    }
+
+    return {};
 }
 
 static bool validate_stage_metadata(
@@ -389,7 +588,9 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
             state->model != nullptr &&
             state->ctx != nullptr &&
             state->vocab != nullptr;
-    const bool split_arch_supported = is_split_graph_execution_architecture(state->architecture);
+    const bool split_arch_supported =
+            is_split_graph_execution_architecture(state->architecture) &&
+            state->split_unsound_reason.empty();
     const bool split_graph_execution =
             state->split_count > 1 &&
             split_arch_supported &&
@@ -402,9 +603,13 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         if (state->split_count <= 1) {
             return std::string("single-stage llama runtime is not initialized");
         }
-        if (!split_arch_supported) {
-            return "native split graph execution currently supports qwen2, qwen2moe, qwen3, and qwen3moe; architecture "
+        if (!is_split_graph_execution_architecture(state->architecture)) {
+            return "native split graph execution currently supports qwen2, qwen2moe, qwen3, qwen3moe,"
+                " qwen35, qwen35moe, and gemma4; architecture "
                 + state->architecture + " is metadata-only in this build";
+        }
+        if (!state->split_unsound_reason.empty()) {
+            return state->split_unsound_reason;
         }
         if (split_graph_execution) {
             return std::string("native split graph execution is available");
@@ -626,7 +831,11 @@ struct split_batch_storage {
 
         tokens.clear();
         embeddings.clear();
-        positions.resize(total_tokens);
+        // M-RoPE models read one position stream per RoPE section from embedding
+        // batches (token batches broadcast stream 0 internally); fill every
+        // stream with the linear text position.
+        const uint32_t n_pos_streams = std::max<uint32_t>(state->pos_streams, 1);
+        positions.resize(total_tokens * n_pos_streams);
         n_seq_ids.assign(total_tokens, 1);
         seq_ids.resize(total_tokens);
         seq_id_ptrs.resize(total_tokens);
@@ -685,7 +894,10 @@ struct split_batch_storage {
 
             for (uint32_t j = 0; j < input.token_count; ++j) {
                 const size_t idx = cursor + j;
-                positions[idx] = static_cast<llama_pos>(input.position_start + j);
+                const llama_pos pos = static_cast<llama_pos>(input.position_start + j);
+                for (uint32_t s = 0; s < n_pos_streams; ++s) {
+                    positions[s * total_tokens + idx] = pos;
+                }
                 seq_ids[idx] = seq_id;
                 seq_id_ptrs[idx] = &seq_ids[idx];
             }
@@ -726,6 +938,126 @@ static llama_sampler * create_default_sampler() {
     return sampler;
 }
 
+// Builds the sampler chain for one request's normalized sampling params.
+// temperature <= 0 is the greedy contract: a single deterministic argmax
+// sampler with no truncation or RNG in the chain.
+static llama_sampler * create_sampler_from_params(const tr_stage_executor_sampler_params & params) {
+    llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (params.temperature <= 0.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        return sampler;
+    }
+    if (params.top_k > 0) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params.top_k));
+    }
+    if (params.top_p < 1.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params.top_p, 1));
+    }
+    if (params.min_p > 0.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_min_p(params.min_p, 1));
+    }
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.seed));
+    return sampler;
+}
+
+static void reset_slot_sampler(tr_slot_sampler_state & slot) {
+    if (slot.sampler != nullptr) {
+        llama_sampler_free(slot.sampler);
+        slot.sampler = nullptr;
+    }
+    slot.configured = false;
+    slot.request_epoch = 0;
+}
+
+static void reset_all_slot_samplers(tr_stage_executor_state * state) {
+    for (auto & slot : state->slot_samplers) {
+        reset_slot_sampler(slot);
+    }
+}
+
+// Returns the sampler configured for this (slot, request epoch), or nullptr
+// when the slot has no matching configuration (callers fall back to the
+// default chain, preserving pre-ABI-v5 behavior).
+static llama_sampler * configured_slot_sampler(
+        tr_stage_executor_state * state,
+        uint32_t slot_id,
+        uint64_t request_epoch) {
+    if (slot_id >= state->slot_samplers.size()) {
+        return nullptr;
+    }
+    auto & slot = state->slot_samplers[slot_id];
+    if (!slot.configured || slot.request_epoch != request_epoch) {
+        return nullptr;
+    }
+    return slot.sampler;
+}
+
+// Extracts the per-request sampling parameters from an OpenAI request body.
+// Absent fields keep the executor's historical defaults (min_p 0.05, temp 0.8,
+// random seed), so requests without sampling fields behave exactly as before.
+// temperature <= 0 selects deterministic greedy decoding, matching the
+// split-stage tr_stage_executor_configure_slot_sampler contract.
+static tr_stage_executor_sampler_params single_stage_sampler_params(const json & body) {
+    tr_stage_executor_sampler_params params = {};
+    params.abi_version = TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION;
+    params.temperature = 0.8f;
+    params.top_p       = 1.0f;
+    params.min_p       = 0.05f;
+    params.top_k       = 0;
+    params.seed        = LLAMA_DEFAULT_SEED;
+
+    const auto read_float = [&](const char * key, float current) {
+        if (!body.contains(key) || !body.at(key).is_number()) {
+            return current;
+        }
+        const float value = body.at(key).get<float>();
+        return std::isfinite(value) ? value : current;
+    };
+    params.temperature = read_float("temperature", params.temperature);
+    params.top_p       = read_float("top_p", params.top_p);
+    params.min_p       = read_float("min_p", params.min_p);
+    if (body.contains("top_k") && body.at("top_k").is_number_integer()) {
+        params.top_k = body.at("top_k").get<int32_t>();
+    }
+    if (body.contains("seed") && body.at("seed").is_number_integer()) {
+        const int64_t seed = body.at("seed").get<int64_t>();
+        if (seed >= 0) {
+            params.seed = static_cast<uint32_t>(seed & 0xFFFFFFFFll);
+        }
+    }
+    return params;
+}
+
+// OpenAI "stop": a single string or an array of strings; empty entries are
+// ignored. Generated text is truncated at the earliest stop match.
+static std::vector<std::string> request_stop_strings(const json & body) {
+    std::vector<std::string> stops;
+    if (!body.contains("stop")) {
+        return stops;
+    }
+    const auto & stop = body.at("stop");
+    if (stop.is_string()) {
+        std::string value = stop.get<std::string>();
+        if (!value.empty()) {
+            stops.push_back(std::move(value));
+        }
+        return stops;
+    }
+    if (stop.is_array()) {
+        for (const auto & item : stop) {
+            if (!item.is_string()) {
+                continue;
+            }
+            std::string value = item.get<std::string>();
+            if (!value.empty()) {
+                stops.push_back(std::move(value));
+            }
+        }
+    }
+    return stops;
+}
+
 static bool generate_single_stage(
         tr_stage_executor_state * state,
         uint32_t slot_id,
@@ -742,6 +1074,12 @@ static bool generate_single_stage(
     if (!request_to_prompt(state->model, payload, prompt, max_tokens, error)) {
         return false;
     }
+
+    // request_to_prompt() already rejected malformed JSON, so this re-parse
+    // only extracts the optional sampling/stop fields.
+    const json body = json::parse(payload);
+    const tr_stage_executor_sampler_params sampler_params = single_stage_sampler_params(body);
+    const std::vector<std::string> stop_strings = request_stop_strings(body);
 
     const llama_seq_id seq_id = static_cast<llama_seq_id>(slot_id);
     llama_memory_seq_rm(llama_get_memory(state->ctx), seq_id, -1, -1);
@@ -770,7 +1108,7 @@ static bool generate_single_stage(
         return false;
     }
 
-    llama_sampler * sampler = create_default_sampler();
+    llama_sampler * sampler = create_sampler_from_params(sampler_params);
     std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler_guard(sampler, llama_sampler_free);
 
     token_batch_storage batch;
@@ -792,6 +1130,24 @@ static bool generate_single_stage(
             return false;
         }
         out += piece;
+
+        // Stop strings: truncate at the earliest match (a match may span token
+        // boundaries, so search the accumulated text) and stop generating.
+        size_t stop_pos = std::string::npos;
+        for (const auto & stop : stop_strings) {
+            const size_t search_from = out.size() >= piece.size() + stop.size() - 1
+                ? out.size() - piece.size() - (stop.size() - 1)
+                : 0;
+            const size_t pos = out.find(stop, search_from);
+            if (pos != std::string::npos && pos < stop_pos) {
+                stop_pos = pos;
+            }
+        }
+        if (stop_pos != std::string::npos) {
+            out.erase(stop_pos);
+            break;
+        }
+
         batch.reset({ next_token }, seq_id, static_cast<llama_pos>(prompt_tokens.size() + i));
     }
 
@@ -808,6 +1164,11 @@ static bool execute_split_stage(
     }
     if (!is_split_graph_execution_architecture(state->architecture)) {
         error = "split-stage graph execution is not available for architecture " + state->architecture;
+        return false;
+    }
+    if (!state->split_unsound_reason.empty()) {
+        error = "split-stage graph execution is not available for this model/stage layout: " +
+            state->split_unsound_reason;
         return false;
     }
 
@@ -847,8 +1208,16 @@ static bool execute_split_stage(
         size_t output_cursor = 0;
         for (uint32_t i = 0; i < call->input_count; ++i) {
             auto & output = call->outputs_ptr[i];
-            llama_sampler * sampler = create_default_sampler();
-            std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler_guard(sampler, llama_sampler_free);
+            // Per-request sampling: use the chain installed for this
+            // (slot, request epoch) at reservation time; fall back to the
+            // default chain when none was configured.
+            llama_sampler * sampler = configured_slot_sampler(
+                state, call->inputs_ptr[i].slot_id, call->inputs_ptr[i].request_epoch);
+            std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler_guard(nullptr, llama_sampler_free);
+            if (sampler == nullptr) {
+                sampler_guard.reset(create_default_sampler());
+                sampler = sampler_guard.get();
+            }
             const llama_token next_token = llama_sampler_sample(
                 sampler,
                 state->ctx,
@@ -998,6 +1367,7 @@ int32_t tr_stage_executor_create(void ** out_handle) {
 void tr_stage_executor_destroy(void * handle) {
     auto * state = as_state(handle);
     if (state != nullptr) {
+        reset_all_slot_samplers(state);
         if (state->ctx != nullptr) {
             llama_free(state->ctx);
             state->ctx = nullptr;
@@ -1041,6 +1411,8 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         return set_error(state, metadata_error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
 
+    reset_all_slot_samplers(state);
+    state->slot_samplers.clear();
     if (state->ctx != nullptr) {
         llama_free(state->ctx);
         state->ctx = nullptr;
@@ -1058,13 +1430,21 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     state->first_layer = metadata.first_layer;
     state->last_layer_exclusive = metadata.last_layer_exclusive;
     state->hidden_dim = metadata.hidden_dim;
+    state->block_count = metadata.block_count;
     state->slot_count = params->slot_count;
     state->context_length = params->context_length;
+    state->pos_streams = 1;
     state->vocab = nullptr;
     state->device_names.clear();
 
+    state->split_unsound_reason.clear();
+    if (params->split_count > 1 && is_split_graph_execution_architecture(metadata.architecture)) {
+        state->split_unsound_reason = split_stage_unsound_reason(metadata);
+    }
+
     const bool load_llama_runtime =
-        params->split_count == 1 || is_split_graph_execution_architecture(metadata.architecture);
+        params->split_count == 1 ||
+        (is_split_graph_execution_architecture(metadata.architecture) && state->split_unsound_reason.empty());
     if (load_llama_runtime) {
         std::call_once(backend_init_once, []() {
             llama_backend_init();
@@ -1108,6 +1488,13 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
             state->vocab = nullptr;
             return set_error(state, "failed to create llama context", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
         }
+
+        // M-RoPE models (e.g. qwen35/qwen35moe IMRoPE) consume one position per
+        // RoPE section when a batch carries embeddings instead of token ids, so
+        // split-stage activation batches must supply all position streams.
+        const llama_rope_type rope_type = llama_model_rope_type(state->model);
+        state->pos_streams =
+            (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
     }
 
     state->loaded = true;
@@ -1127,6 +1514,8 @@ int32_t tr_stage_executor_alloc_slots(void * handle, uint32_t slot_count) {
         return set_error(state, "slot allocation count does not match loaded runtime config", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
     state->slot_epochs.assign(slot_count, 0);
+    reset_all_slot_samplers(state);
+    state->slot_samplers.assign(slot_count, tr_slot_sampler_state{});
     state->last_error.clear();
     return TENSORRELAY_STAGE_EXECUTOR_OK;
 }
@@ -1212,7 +1601,9 @@ int32_t tr_stage_executor_execute_batch(void * handle, tr_stage_executor_batch_c
     if (state->split_count != 1) {
         std::string error;
         if (!execute_split_stage(state, call, error)) {
-            const int32_t code = is_split_graph_execution_architecture(state->architecture)
+            const int32_t code =
+                is_split_graph_execution_architecture(state->architecture) &&
+                state->split_unsound_reason.empty()
                 ? TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT
                 : TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED;
             return set_error(state, error, code);
@@ -1332,7 +1723,159 @@ int32_t tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t
     if (state->ctx != nullptr) {
         llama_memory_seq_rm(llama_get_memory(state->ctx), static_cast<llama_seq_id>(slot_id), -1, -1);
     }
+    if (slot_id < state->slot_samplers.size()) {
+        reset_slot_sampler(state->slot_samplers[slot_id]);
+    }
     state->slot_epochs[slot_id] = std::max(state->slot_epochs[slot_id], request_epoch);
+    state->last_error.clear();
+    return TENSORRELAY_STAGE_EXECUTOR_OK;
+}
+
+// One benchmark decode step: a single decode-shaped token (token-id input on
+// the first/single stage, zero-filled fp32 embedding on later stages) at the
+// given position on scratch sequence 0.
+static bool benchmark_decode_step(
+        tr_stage_executor_state * state,
+        std::vector<float> & scratch_embd,
+        std::vector<llama_pos> & scratch_pos,
+        llama_pos pos,
+        std::string & error) {
+    const bool token_input = state->split_count == 1 || state->stage_index == 0;
+    llama_token token = 0;
+    if (token_input && state->vocab != nullptr) {
+        const llama_token bos = llama_vocab_bos(state->vocab);
+        if (bos >= 0) {
+            token = bos;
+        }
+    }
+    const uint32_t n_pos_streams = std::max<uint32_t>(state->pos_streams, 1);
+    scratch_pos.assign(n_pos_streams, pos);
+    int32_t n_seq_one = 1;
+    llama_seq_id seq_zero = 0;
+    llama_seq_id * seq_ptr = &seq_zero;
+    int8_t logit_one = 1;
+
+    llama_batch batch = {};
+    batch.n_tokens = 1;
+    if (token_input) {
+        batch.token = &token;
+        batch.embd = nullptr;
+    } else {
+        batch.token = nullptr;
+        batch.embd = scratch_embd.data();
+    }
+    batch.pos = scratch_pos.data();
+    batch.n_seq_id = &n_seq_one;
+    batch.seq_id = &seq_ptr;
+    batch.logits = &logit_one;
+
+    const int decode_rc = llama_decode(state->ctx, batch);
+    if (decode_rc != 0) {
+        error = "benchmark llama_decode failed with code " + std::to_string(decode_rc);
+        return false;
+    }
+    return true;
+}
+
+// ABI v6: warmup benchmark (see header contract). Runs on scratch sequence 0,
+// clears that sequence's KV afterwards, and never touches slot epochs or
+// sampler chains.
+int32_t tr_stage_executor_benchmark(
+        void * handle,
+        uint32_t steps,
+        tr_stage_executor_benchmark_result * out) {
+    auto * state = as_state(handle);
+    if (state == nullptr || out == nullptr) {
+        return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
+    }
+    out->total_ms = 0.0;
+    out->steps_executed = 0;
+    out->layers_executed = 0;
+    if (steps == 0) {
+        return set_error(state, "benchmark steps must be greater than zero", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    const uint32_t capped_steps = std::min<uint32_t>(steps, TENSORRELAY_STAGE_EXECUTOR_BENCHMARK_MAX_STEPS);
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->loaded) {
+        return set_error(state, "stage executor is not loaded", TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED);
+    }
+    if (state->model == nullptr || state->ctx == nullptr) {
+        return set_error(
+            state,
+            "benchmark unsupported: stage was loaded metadata-only without an executable llama runtime",
+            TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED);
+    }
+    const uint32_t layers = state->last_layer_exclusive > state->first_layer
+        ? state->last_layer_exclusive - state->first_layer
+        : state->block_count;
+    if (layers == 0) {
+        return set_error(state, "benchmark cannot determine the stage layer count", TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED);
+    }
+
+    std::vector<float> scratch_embd;
+    if (state->split_count > 1 && state->stage_index > 0) {
+        scratch_embd.assign(state->hidden_dim, 0.0f);
+    }
+    std::vector<llama_pos> scratch_pos;
+    std::string error;
+
+    // Untimed priming step: first-run graph build/allocation must not skew
+    // the per-layer measurement.
+    if (!benchmark_decode_step(state, scratch_embd, scratch_pos, 0, error)) {
+        llama_memory_seq_rm(llama_get_memory(state->ctx), 0, -1, -1);
+        return set_error(state, error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < capped_steps; ++i) {
+        if (!benchmark_decode_step(state, scratch_embd, scratch_pos, static_cast<llama_pos>(i + 1), error)) {
+            llama_memory_seq_rm(llama_get_memory(state->ctx), 0, -1, -1);
+            return set_error(state, error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        }
+    }
+    const auto finished = std::chrono::steady_clock::now();
+
+    // Clear the scratch sequence so benchmark KV never leaks into a slot.
+    llama_memory_seq_rm(llama_get_memory(state->ctx), 0, -1, -1);
+
+    out->total_ms = std::chrono::duration<double, std::milli>(finished - started).count();
+    out->steps_executed = capped_steps;
+    out->layers_executed = layers;
+    state->last_error.clear();
+    return TENSORRELAY_STAGE_EXECUTOR_OK;
+}
+
+// ABI v5: install the per-(slot, request epoch) sampler chain used by
+// final-stage sampling. Reservation-time call; replaces any previous chain.
+int32_t tr_stage_executor_configure_slot_sampler(
+        void * handle,
+        const tr_stage_executor_sampler_params * params) {
+    auto * state = as_state(handle);
+    if (state == nullptr || params == nullptr) {
+        return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
+    }
+    if (params->abi_version != TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION) {
+        return set_error(state, "stage executor sampler ABI version mismatch", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->loaded || state->slot_samplers.empty()) {
+        return set_error(state, "stage executor slots are not allocated", TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED);
+    }
+    if (params->slot_id >= state->slot_samplers.size()) {
+        return set_error(state, "sampler configuration references an unknown slot", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    if (params->request_epoch < state->slot_epochs[params->slot_id]) {
+        return set_error(state, "sampler configuration references a stale slot epoch", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    if (!std::isfinite(params->temperature) || !std::isfinite(params->top_p) || !std::isfinite(params->min_p)) {
+        return set_error(state, "sampler configuration contains non-finite values", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    auto & slot = state->slot_samplers[params->slot_id];
+    reset_slot_sampler(slot);
+    slot.sampler = create_sampler_from_params(*params);
+    slot.request_epoch = params->request_epoch;
+    slot.configured = true;
     state->last_error.clear();
     return TENSORRELAY_STAGE_EXECUTOR_OK;
 }

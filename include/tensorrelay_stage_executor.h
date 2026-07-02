@@ -17,11 +17,14 @@
 extern "C" {
 #endif
 
-#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 4u
+#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 6u
 #define TENSORRELAY_STAGE_EXECUTOR_OK 0
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT -1
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED -2
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED -40
+
+// ABI v6: hard cap on tr_stage_executor_benchmark decode steps.
+#define TENSORRELAY_STAGE_EXECUTOR_BENCHMARK_MAX_STEPS 16u
 
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_REQUEST_JSON (1u << 0)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_FINAL_CHUNK  (1u << 1)
@@ -65,6 +68,33 @@ typedef struct tr_stage_executor_slot_output {
     uint32_t flags;
 } tr_stage_executor_slot_output;
 
+// ABI v5: per-(slot, request epoch) sampler configuration. The runtime calls
+// tr_stage_executor_configure_slot_sampler at reservation time on the final
+// stage; sampling steps for a matching (slot_id, request_epoch) then use this
+// chain instead of the built-in default (min_p 0.05, temp 0.8, random seed).
+// temperature <= 0 selects fully deterministic greedy decoding. top_k <= 0,
+// top_p >= 1, and min_p <= 0 disable the respective samplers. seed 0xFFFFFFFF
+// (LLAMA_DEFAULT_SEED) draws a random seed.
+typedef struct tr_stage_executor_sampler_params {
+    uint32_t abi_version;
+    uint32_t slot_id;
+    uint64_t request_epoch;
+    float    temperature;
+    float    top_p;
+    float    min_p;
+    int32_t  top_k;
+    uint32_t seed;
+    uint32_t reserved;
+} tr_stage_executor_sampler_params;
+
+// ABI v6: warmup benchmark result. total_ms is the wall-clock time across the
+// timed decode steps; ms-per-layer = total_ms / (steps_executed * layers_executed).
+typedef struct tr_stage_executor_benchmark_result {
+    double   total_ms;
+    uint32_t steps_executed;
+    uint32_t layers_executed;
+} tr_stage_executor_benchmark_result;
+
 typedef struct tr_stage_executor_batch_call {
     uint32_t abi_version;
     uint32_t input_count;
@@ -104,7 +134,26 @@ TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_tokenize(
     int32_t * out_tokens_ptr,
     size_t out_tokens_cap,
     size_t * out_token_count);
+// ABI v5: installs the sampler chain used for final-stage sampling of the
+// given (slot, request epoch). Stale epochs (older than the slot's current
+// epoch) are rejected. Reconfiguring replaces any previous chain for the slot.
+TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_configure_slot_sampler(
+    void * handle,
+    const tr_stage_executor_sampler_params * params);
 TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t request_epoch);
+// ABI v6: runs `steps` (capped at TENSORRELAY_STAGE_EXECUTOR_BENCHMARK_MAX_STEPS)
+// batch-1 decode-shaped steps through the loaded stage graph on scratch
+// sequence 0 and reports total wall-clock time plus the stage's layer count.
+// One untimed priming step precedes the timed loop so first-run graph
+// allocation does not skew the measurement. The scratch sequence's KV cells
+// are cleared afterwards; slot epochs and samplers are untouched. Call during
+// warmup, before any slot holds live KV state (the scratch sequence aliases
+// slot 0's KV lane). Metadata-only stage loads without an executable llama
+// runtime return TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED.
+TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_benchmark(
+    void * handle,
+    uint32_t steps,
+    tr_stage_executor_benchmark_result * out);
 TENSORRELAY_STAGE_EXECUTOR_API size_t   tr_stage_executor_last_error(void * handle, uint8_t * out_ptr, size_t out_len);
 
 #ifdef __cplusplus
