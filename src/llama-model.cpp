@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1024,6 +1025,103 @@ llama_model::~llama_model() {
     }
 }
 
+static bool gguf_try_get_u32(const gguf_context * ctx, const char * key, uint32_t & out) {
+    const int64_t id = gguf_find_key(ctx, key);
+    if (id < 0) {
+        return false;
+    }
+
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:
+            out = gguf_get_val_u8(ctx, id);
+            return true;
+        case GGUF_TYPE_UINT16:
+            out = gguf_get_val_u16(ctx, id);
+            return true;
+        case GGUF_TYPE_UINT32:
+            out = gguf_get_val_u32(ctx, id);
+            return true;
+        case GGUF_TYPE_UINT64: {
+            const uint64_t value = gguf_get_val_u64(ctx, id);
+            if (value > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            out = (uint32_t) value;
+            return true;
+        }
+        case GGUF_TYPE_INT8: {
+            const int8_t value = gguf_get_val_i8(ctx, id);
+            if (value < 0) {
+                return false;
+            }
+            out = (uint32_t) value;
+            return true;
+        }
+        case GGUF_TYPE_INT16: {
+            const int16_t value = gguf_get_val_i16(ctx, id);
+            if (value < 0) {
+                return false;
+            }
+            out = (uint32_t) value;
+            return true;
+        }
+        case GGUF_TYPE_INT32: {
+            const int32_t value = gguf_get_val_i32(ctx, id);
+            if (value < 0) {
+                return false;
+            }
+            out = (uint32_t) value;
+            return true;
+        }
+        case GGUF_TYPE_INT64: {
+            const int64_t value = gguf_get_val_i64(ctx, id);
+            if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            out = (uint32_t) value;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+static bool gguf_try_get_bool(const gguf_context * ctx, const char * key, bool & out) {
+    const int64_t id = gguf_find_key(ctx, key);
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_BOOL) {
+        return false;
+    }
+    out = gguf_get_val_bool(ctx, id);
+    return true;
+}
+
+static bool is_tensorrelay_output_tensor(llm_tensor tensor) {
+    return tensor == LLM_TENSOR_OUTPUT ||
+        tensor == LLM_TENSOR_OUTPUT_NORM ||
+        tensor == LLM_TENSOR_OUTPUT_NORM_LFM2;
+}
+
+bool llama_model::tensorrelay_stage_is_first() const {
+    return !tensorrelay_stage || tensorrelay_stage_index == 0;
+}
+
+bool llama_model::tensorrelay_stage_is_final() const {
+    return !tensorrelay_stage || tensorrelay_stage_index + 1 == tensorrelay_stage_count;
+}
+
+bool llama_model::tensorrelay_layer_in_stage(int il) const {
+    return !tensorrelay_stage ||
+        (il >= (int) tensorrelay_first_layer && il < (int) tensorrelay_last_layer_exclusive);
+}
+
+int llama_model::tensorrelay_stage_first_layer() const {
+    return tensorrelay_stage ? (int) tensorrelay_first_layer : 0;
+}
+
+int llama_model::tensorrelay_stage_last_layer(int n_layer) const {
+    return tensorrelay_stage ? std::min((int) tensorrelay_last_layer_exclusive, n_layer) : n_layer;
+}
+
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
@@ -1068,6 +1166,31 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             hparams.n_expert      = 0;
             hparams.n_expert_used = 0;
         }
+    }
+
+    bool tensorrelay_stage_marker = false;
+    if (gguf_try_get_bool(ctx, "tensorrelay.stage", tensorrelay_stage_marker) && tensorrelay_stage_marker) {
+        uint32_t stage_index = 0;
+        uint32_t stage_count = 0;
+        uint32_t first_layer = 0;
+        uint32_t last_layer_exclusive = 0;
+        if (!gguf_try_get_u32(ctx, "tensorrelay.stage.index", stage_index) ||
+                !gguf_try_get_u32(ctx, "tensorrelay.stage.count", stage_count) ||
+                !gguf_try_get_u32(ctx, "tensorrelay.stage.first_layer", first_layer) ||
+                !gguf_try_get_u32(ctx, "tensorrelay.stage.last_layer_exclusive", last_layer_exclusive)) {
+            throw std::runtime_error("TensorRelay stage GGUF metadata is incomplete or has invalid integer types");
+        }
+        if (stage_count == 0 || stage_index >= stage_count) {
+            throw std::runtime_error("TensorRelay stage GGUF metadata has invalid stage index/count");
+        }
+        if (first_layer >= last_layer_exclusive || last_layer_exclusive > hparams.n_layer_all) {
+            throw std::runtime_error("TensorRelay stage GGUF metadata has invalid layer range");
+        }
+        tensorrelay_stage = true;
+        tensorrelay_stage_index = stage_index;
+        tensorrelay_stage_count = stage_count;
+        tensorrelay_first_layer = first_layer;
+        tensorrelay_last_layer_exclusive = last_layer_exclusive;
     }
 
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
@@ -1486,7 +1609,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(tensorrelay_stage);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -1640,6 +1763,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    if (tensorrelay_stage) {
+        if (tn.bid < 0 && tn.tensor == LLM_TENSOR_TOKEN_EMBD &&
+                (flags & TENSOR_DUPLICATED) && !tensorrelay_stage_is_final()) {
+            return nullptr;
+        }
+        if (tn.bid >= 0 && !tensorrelay_layer_in_stage(tn.bid)) {
+            flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        } else if (tn.bid < 0) {
+            if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED) && !tensorrelay_stage_is_first()) {
+                flags |= TENSOR_NOT_REQUIRED;
+            }
+            if (is_tensorrelay_output_tensor(tn.tensor) && !tensorrelay_stage_is_final()) {
+                flags |= TENSOR_NOT_REQUIRED;
+            }
+            if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED) && !tensorrelay_stage_is_final()) {
+                flags |= TENSOR_NOT_REQUIRED;
+            }
+        }
+    }
+
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     const buft_list_t * buft_list_shard = nullptr;
     const llama_model_loader::llama_tensor_weight * weight = ml.get_weight(tn.str().c_str());

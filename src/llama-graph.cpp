@@ -1847,6 +1847,19 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
+    if (tok_embd == nullptr) {
+        ggml_tensor * cur = inp->embd;
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
+
+        res->t_inp_embd = cur;
+        cb(cur, "embd", -1);
+        res->add_input(std::move(inp));
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
+
     // select one of the 2 inputs, based on the batch contents
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
     std::array<ggml_tensor *, 2> inps;

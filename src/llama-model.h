@@ -604,6 +604,12 @@ struct llama_model {
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
+    bool     tensorrelay_stage                = false;
+    uint32_t tensorrelay_stage_index          = 0;
+    uint32_t tensorrelay_stage_count          = 1;
+    uint32_t tensorrelay_first_layer          = 0;
+    uint32_t tensorrelay_last_layer_exclusive = 0;
+
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
 
@@ -619,6 +625,12 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+
+    bool tensorrelay_stage_is_first() const;
+    bool tensorrelay_stage_is_final() const;
+    bool tensorrelay_layer_in_stage(int il) const;
+    int  tensorrelay_stage_first_layer() const;
+    int  tensorrelay_stage_last_layer(int n_layer) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

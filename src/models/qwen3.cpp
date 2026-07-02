@@ -58,8 +58,10 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
+    const int first_layer = model.tensorrelay_stage_first_layer();
+    const int last_layer  = model.tensorrelay_stage_last_layer(n_layer);
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = build_inp_embd(model.tensorrelay_stage_is_first() ? model.tok_embd : nullptr);
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -68,7 +70,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = first_layer; il < last_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -111,7 +113,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == last_layer - 1 && inp_out_ids && model.tensorrelay_stage_is_final()) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -141,6 +143,12 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         inpL = cur;
     }
     cur = inpL;
+
+    if (model.tensorrelay_stage && !model.tensorrelay_stage_is_final()) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
