@@ -1,5 +1,13 @@
 name: TensorRelay Build
 
+# Validates and packages the TensorRelay Stage Executor Library (ADR-0015 /
+# ADR-0016): the dynamically loaded C ABI the tensorrelay-runtime drives.
+# The Steam packaging pipeline in the tensorrelay repo builds this fork from
+# source itself (CPU-only); this workflow adds GPU-backend compile coverage
+# (Vulkan on Linux, CUDA/MSVC on Windows) and publishes executor bundles for
+# manual testing. The legacy llama-server / rpc-server artifacts are gone with
+# the RPC path (hard removal, ADR-0015).
+
 on:
   push:
     branches: [tensorrelay]
@@ -14,8 +22,8 @@ env:
     -DLLAMA_BUILD_EXAMPLES=OFF
     -DLLAMA_BUILD_TESTS=OFF
     -DLLAMA_BUILD_TOOLS=ON
-    -DLLAMA_BUILD_SERVER=ON
-    -DGGML_RPC=ON
+    -DLLAMA_BUILD_SERVER=OFF
+    -DGGML_RPC=OFF
     -DGGML_NATIVE=OFF
     -DGGML_BACKEND_DL=ON
 
@@ -26,77 +34,80 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show RPC protocol version from source
-        run: |
-          echo "=== RPC Protocol Version in Source ==="
-          grep -E 'RPC_PROTO_(MAJOR|MINOR|PATCH)_VERSION' ggml/include/ggml-rpc.h
-          echo "======================================"
-
       - name: Install Vulkan SDK
         run: |
           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update -y
-          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk
 
-      - name: Build
+      - name: Build stage executor
         run: |
-          # Fresh tree avoids stale object files (e.g. ggml-rpc with old RPC_PROTO_*).
+          # Fresh tree avoids stale object files between workflow revisions.
           rm -rf build
           cmake -B build \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_VULKAN=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
-            -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_COMMON }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target tensorrelay_stage_executor -j $(nproc)
 
       - name: Pack artifacts
         run: |
           mkdir -p dist
-          cp build/bin/llama-server dist/
-          cp build/bin/rpc-server dist/
-          # Copy all .so variants as real files (no symlinks — SteamPipe drops them)
-          find build/bin -name '*.so*' -exec cp -L {} dist/ \;
+          cp -L build/bin/libtensorrelay_stage_executor.so dist/
+          # Copy the executor's runtime set: unversioned and SONAME names only,
+          # materialized as real files (no symlinks — SteamPipe drops them).
+          # Skip fully versioned files (libllama.so.0.0.NNNN); nothing
+          # references them and they accumulate one per rebuild.
+          shopt -s nullglob
+          for lib in build/bin/libllama.so* build/bin/libggml*.so*; do
+            case "$(basename "$lib")" in
+              *.so|*.so.[0-9]|*.so.[0-9][0-9]) cp -L "$lib" dist/ ;;
+            esac
+          done
+          shopt -u nullglob
           cp LICENSE dist/
           echo "Packed libraries:"
           ls -lh dist/*.so* || true
-          # Verify versioned SONAMEs are present (not just unversioned .so)
+          # Verify SONAME names are present (not just unversioned .so)
           ls dist/*.so.0 >/dev/null 2>&1 || { echo "::error::No .so.0 files found — SONAME resolution will fail"; exit 1; }
-          
-          # Smoke test: verify libggml-rpc.so contains expected version string
-          if [ -f dist/libggml-rpc.so ]; then
-            echo "=== Checking libggml-rpc.so for version string ==="
-            strings dist/libggml-rpc.so | grep "Starting RPC server" || echo "::warning::Version string not found in libggml-rpc.so"
-          fi
-          
-          tar -czvf llama-tensorrelay-linux-vulkan-x64.tar.gz -C dist .
+          # Verify the full stage executor ABI is exported
+          for sym in abi_version create destroy load alloc_slots \
+            activation_descriptor_json capabilities_json execute_batch \
+            release_slot last_error tokenize; do
+            nm -D dist/libtensorrelay_stage_executor.so | grep -q " tr_stage_executor_${sym}$" \
+              || { echo "::error::Missing ABI export tr_stage_executor_${sym}"; exit 1; }
+          done
+          tar -czvf tensorrelay-stage-executor-linux-vulkan-x64.tar.gz -C dist .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: llama-tensorrelay-linux-vulkan-x64
-          path: llama-tensorrelay-linux-vulkan-x64.tar.gz
+          name: tensorrelay-stage-executor-linux-vulkan-x64
+          path: tensorrelay-stage-executor-linux-vulkan-x64.tar.gz
           retention-days: 30
 
   windows-cuda-x64:
-    name: Windows CUDA 13.1 x64
+    name: Windows CUDA 13.1 + Vulkan x64
     runs-on: windows-2022
+    env:
+      VULKAN_VERSION: 1.4.313.2
     steps:
       - uses: actions/checkout@v4
-
-      - name: Show RPC protocol version from source
-        shell: pwsh
-        run: |
-          Write-Host "=== RPC Protocol Version in Source ==="
-          Select-String -Path ggml/include/ggml-rpc.h -Pattern "RPC_PROTO_(MAJOR|MINOR|PATCH)_VERSION"
-          Write-Host "======================================"
 
       - name: Install CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
           cuda_version: '13.1'
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
       - name: Install Ninja
         run: choco install ninja
@@ -106,9 +117,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: win-cuda13.1-v2-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
+          key: win-cuda13.1-vulkan-v4-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
 
-      - name: Build
+      - name: Build stage executor
         if: steps.cache-win-build.outputs.cache-hit != 'true'
         shell: cmd
         run: |
@@ -116,19 +127,18 @@ jobs:
           if exist build rmdir /s /q build
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
+            -DGGML_VULKAN=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;100;120" ^
-            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_COMMON }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release --target tensorrelay_stage_executor -j %NINJA_JOBS%
 
       - name: Pack artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item build\bin\Release\llama-server.exe dist\
-          Copy-Item build\bin\Release\rpc-server.exe dist\
+          Copy-Item build\bin\Release\tensorrelay_stage_executor.dll dist\
           Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination dist\
           # Bundle CUDA runtime DLLs (not in build output, installed system-wide by toolkit)
           $cudaBin = Join-Path $env:CUDA_PATH "bin"
@@ -137,13 +147,14 @@ jobs:
           Copy-Item "$cudaBin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
           Copy-Item LICENSE dist\
           Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
-          Compress-Archive -Path dist\* -DestinationPath llama-tensorrelay-win-cuda-13.1-x64.zip
+          if (-not (Test-Path dist\tensorrelay_stage_executor.dll)) { Write-Error "stage executor dll missing" }
+          Compress-Archive -Path dist\* -DestinationPath tensorrelay-stage-executor-win-cuda-13.1-x64.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: llama-tensorrelay-win-cuda-13.1-x64
-          path: llama-tensorrelay-win-cuda-13.1-x64.zip
+          name: tensorrelay-stage-executor-win-cuda-13.1-x64
+          path: tensorrelay-stage-executor-win-cuda-13.1-x64.zip
           retention-days: 30
 
   release:
@@ -167,25 +178,10 @@ jobs:
           tag_name: tensorrelay-${{ github.sha }}
           name: TensorRelay Build ${{ github.sha }}
           body: |
-            Automated build from tensorrelay branch.
+            Stage Executor Library bundles built from the tensorrelay branch.
             Commit: ${{ github.sha }}
           draft: false
           prerelease: true
           files: |
-            artifacts/llama-tensorrelay-linux-vulkan-x64/llama-tensorrelay-linux-vulkan-x64.tar.gz
-            artifacts/llama-tensorrelay-win-cuda-13.1-x64/llama-tensorrelay-win-cuda-13.1-x64.zip
-
-      - name: Trigger TensorRelay Steam build
-        env:
-          DISPATCH_TOKEN: ${{ secrets.TENSORRELAY_DISPATCH_TOKEN }}
-        run: |
-          if [ -z "$DISPATCH_TOKEN" ]; then
-            echo "TENSORRELAY_DISPATCH_TOKEN not set; skip dispatch"
-            exit 0
-          fi
-          curl -fsSL -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token ${DISPATCH_TOKEN}" \
-            https://api.github.com/repos/mpainenz/tensorrelay/dispatches \
-            -d '{"event_type":"llama-fork-release","client_payload":{"tag":"tensorrelay-${{ github.sha }}","commit":"${{ github.sha }}"}}'
-          echo "Dispatched llama-fork-release to mpainenz/tensorrelay with tag tensorrelay-${{ github.sha }}"
+            artifacts/tensorrelay-stage-executor-linux-vulkan-x64/tensorrelay-stage-executor-linux-vulkan-x64.tar.gz
+            artifacts/tensorrelay-stage-executor-win-cuda-13.1-x64/tensorrelay-stage-executor-win-cuda-13.1-x64.zip
