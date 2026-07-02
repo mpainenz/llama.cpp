@@ -176,9 +176,32 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // TensorRelay layer-stage bounds. Only the residual hidden state crosses a
+    // stage boundary, which constrains which Gemma4 configurations may be split:
+    //  - per-layer token embeddings are derived from the token ids and the
+    //    layer-0 input embedding, neither of which is available past stage 0;
+    //  - KV-shared tail layers read K/V written by the last KV-owning layers,
+    //    so a stage containing a shared layer must also contain both sources.
+    const bool tr_multi_stage =
+        model.tensorrelay_stage && !(model.tensorrelay_stage_is_first() && model.tensorrelay_stage_is_final());
+    const int first_layer = model.tensorrelay_stage_first_layer();
+    const int last_layer  = model.tensorrelay_stage_last_layer(n_layer);
 
-    // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
+    if (tr_multi_stage) {
+        if (model.per_layer_tok_embd) {
+            throw std::runtime_error("Gemma4 with per-layer token embeddings cannot run as a TensorRelay layer stage");
+        }
+        if (hparams.n_layer_kv_from_start >= 0 && hparams.n_layer_kv_from_start < (int32_t) n_layer &&
+                last_layer > hparams.n_layer_kv_from_start &&
+                first_layer > hparams.n_layer_kv_from_start - 2) {
+            throw std::runtime_error("Gemma4 TensorRelay stage splits KV-shared layers from their source layers");
+        }
+    }
+
+    inpL = build_inp_embd(model.tensorrelay_stage_is_first() ? model.tok_embd : nullptr);
+
+    // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings
+    // or a TensorRelay stage-boundary hidden state, which is already in residual space)
     inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
     cb(inpL, "inp_scaled", -1);
 
@@ -188,7 +211,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // TODO: is causal == true correct? might need some changes
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // TensorRelay: non-final stages emit embeddings for every token and never
+    // gather output rows, so building the out_ids input would leave it without
+    // a consumer (and therefore without an allocated buffer) in the graph.
+    ggml_tensor * inp_out_ids = model.tensorrelay_stage_is_final() ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -199,7 +225,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = first_layer; il < last_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
 
@@ -275,7 +301,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
         // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == last_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -375,7 +401,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
             // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+            if (il == last_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -401,6 +427,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    // TensorRelay: non-final stages export the raw hidden state for every token
+    // and stop before output norm / LM head (owned by the final stage).
+    if (model.tensorrelay_stage && !model.tensorrelay_stage_is_final()) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, nullptr,

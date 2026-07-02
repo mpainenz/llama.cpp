@@ -1769,7 +1769,14 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             return nullptr;
         }
         if (tn.bid >= 0 && !tensorrelay_layer_in_stage(tn.bid)) {
-            flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+            // Only physical per-layer tensors (blk.N.*) are partitioned across
+            // stage shards. Tensors that are bid-indexed in the loader but
+            // globally named on disk (e.g. gemma rope_freqs.weight) are
+            // duplicated into every stage shard and must load normally, or the
+            // loader would both skip-count and load the same file tensor.
+            if (tn.str().compare(0, 4, "blk.") == 0) {
+                flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+            }
         } else if (tn.bid < 0) {
             if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED) && !tensorrelay_stage_is_first()) {
                 flags |= TENSOR_NOT_REQUIRED;

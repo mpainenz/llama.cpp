@@ -168,17 +168,27 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // TensorRelay layer-stage bounds: the per-layer recurrent (gated delta net)
+    // and attention state live in this stage's own memory context, so the only
+    // tensor crossing a stage boundary is the residual hidden state.
+    const int first_layer = model.tensorrelay_stage_first_layer();
+    const int last_layer  = model.tensorrelay_stage_last_layer(n_layer);
+
+    inpL = build_inp_embd(model.tensorrelay_stage_is_first() ? model.tok_embd : nullptr);
 
     cb(inpL, "model.input_embed", -1);
 
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // TensorRelay: non-final stages emit embeddings for every token and never
+    // gather output rows, so building the out_ids input would leave it without
+    // a consumer (and therefore without an allocated buffer) in the graph.
+    ggml_tensor * inp_out_ids = model.tensorrelay_stage_is_final() ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = first_layer; il < last_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -197,7 +207,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == last_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -228,6 +238,14 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         inpL = cur;
     }
     cur = inpL;
+
+    // TensorRelay: non-final stages export the raw hidden state for every token
+    // and stop before output norm / LM head (owned by the final stage).
+    if (model.tensorrelay_stage && !model.tensorrelay_stage_is_final()) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // post-norm hidden state feeds both the LM head and the MTP seed below
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
