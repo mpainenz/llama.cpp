@@ -76,6 +76,10 @@ struct tr_stage_executor_state {
     uint32_t    spill_layer_count = 0;
     std::string spill_devices;
     std::string spill_engine_applied;
+    // ABI v9 KV Cache Policy; the ggml type names actually applied to the
+    // created context (empty on metadata-only loads, which create no cache).
+    std::string cache_type_k_applied;
+    std::string cache_type_v_applied;
     bool        loaded = false;
     std::vector<std::string> device_names;
     std::vector<uint64_t> slot_epochs;
@@ -104,6 +108,21 @@ static std::string bytes_to_string(const uint8_t * ptr, size_t len) {
         return {};
     }
     return std::string(reinterpret_cast<const char *>(ptr), len);
+}
+
+// ABI v9 KV Cache Policy: map a wire cache-type name to the ggml type the
+// context allocates with. Empty selects f16 (the pre-v9 default). The names
+// match ggml_type_name() output so the capabilities echo round-trips.
+static bool kv_cache_type_from_name(const std::string & name, ggml_type & out) {
+    if (name.empty() || name == "f16") { out = GGML_TYPE_F16;  return true; }
+    if (name == "bf16")                { out = GGML_TYPE_BF16; return true; }
+    if (name == "f32")                 { out = GGML_TYPE_F32;  return true; }
+    if (name == "q8_0")                { out = GGML_TYPE_Q8_0; return true; }
+    if (name == "q5_1")                { out = GGML_TYPE_Q5_1; return true; }
+    if (name == "q5_0")                { out = GGML_TYPE_Q5_0; return true; }
+    if (name == "q4_1")                { out = GGML_TYPE_Q4_1; return true; }
+    if (name == "q4_0")                { out = GGML_TYPE_Q4_0; return true; }
+    return false;
 }
 
 static bool gguf_bool(const gguf_context * ctx, const char * key, bool & out, std::string & error) {
@@ -646,6 +665,11 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         { "supports_layer_spill", true },
         { "spill_layer_count", state->spill_layer_count },
         { "spill_devices", state->spill_engine_applied },
+        // ABI v9: the KV cache types ACTUALLY applied to the created context
+        // (ggml_type_name form; empty on metadata-only loads, which create no
+        // cache). The runtime verifies requested == applied at warmup.
+        { "cache_type_k", state->cache_type_k_applied },
+        { "cache_type_v", state->cache_type_v_applied },
         { "reason", reason },
     };
     out = capabilities.dump();
@@ -1489,6 +1513,18 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     if (params->slot_count == 0) {
         return set_error(state, "slot_count must be greater than zero", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
+    // ABI v9: validate the KV Cache Policy up front - a bad type name is a
+    // caller error regardless of whether this load reaches a llama runtime.
+    const std::string cache_type_k_name = bytes_to_string(params->cache_type_k_ptr, params->cache_type_k_len);
+    const std::string cache_type_v_name = bytes_to_string(params->cache_type_v_ptr, params->cache_type_v_len);
+    ggml_type cache_type_k = GGML_TYPE_F16;
+    ggml_type cache_type_v = GGML_TYPE_F16;
+    if (!kv_cache_type_from_name(cache_type_k_name, cache_type_k)) {
+        return set_error(state, "unknown cache_type_k: " + cache_type_k_name, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    if (!kv_cache_type_from_name(cache_type_v_name, cache_type_v)) {
+        return set_error(state, "unknown cache_type_v: " + cache_type_v_name, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
     std::string shard_path = bytes_to_string(params->shard_path_ptr, params->shard_path_len);
     if (shard_path.empty()) {
         return set_error(state, "shard path is empty", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
@@ -1537,6 +1573,8 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     state->spill_layer_count = 0;
     state->spill_devices = bytes_to_string(params->spill_devices_ptr, params->spill_devices_len);
     state->spill_engine_applied.clear();
+    state->cache_type_k_applied.clear();
+    state->cache_type_v_applied.clear();
 
     state->split_unsound_reason.clear();
     if (params->split_count > 1 && is_split_graph_execution_architecture(metadata.architecture)) {
@@ -1649,13 +1687,32 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         ctx_params.no_perf = true;
         ctx_params.embeddings = params->split_count > 1 && params->stage_index < params->split_count - 1;
         ctx_params.n_outputs_max = ctx_params.n_batch;
+        // ABI v9 KV Cache Policy: allocate the cache with the manifest-stamped
+        // types. Any non-f16 type FORCES flash attention on (quantized caches
+        // require it) so an unsupported backend fails the load loudly instead
+        // of llama silently disabling FA and rejecting the quantized V - the
+        // solver budgeted the quantized cache size, so a fallback to f16 here
+        // would OOM exactly the tight fits the budget protects.
+        ctx_params.type_k = cache_type_k;
+        ctx_params.type_v = cache_type_v;
+        if (cache_type_k != GGML_TYPE_F16 || cache_type_v != GGML_TYPE_F16) {
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
         state->ctx = llama_init_from_model(state->model, ctx_params);
         if (state->ctx == nullptr) {
             llama_model_free(state->model);
             state->model = nullptr;
             state->vocab = nullptr;
-            return set_error(state, "failed to create llama context", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+            return set_error(state,
+                "failed to create llama context (cache_type_k=" + std::string(ggml_type_name(cache_type_k)) +
+                " cache_type_v=" + std::string(ggml_type_name(cache_type_v)) +
+                (cache_type_k != GGML_TYPE_F16 || cache_type_v != GGML_TYPE_F16
+                    ? ", flash attention forced on: quantized KV requires it and this backend/model may not support it"
+                    : "") + ")",
+                TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
         }
+        state->cache_type_k_applied = ggml_type_name(cache_type_k);
+        state->cache_type_v_applied = ggml_type_name(cache_type_v);
 
         // M-RoPE models (e.g. qwen35/qwen35moe IMRoPE) consume one position per
         // RoPE section when a batch carries embeddings instead of token ids, so

@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 8u
+#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 9u
 #define TENSORRELAY_STAGE_EXECUTOR_OK 0
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT -1
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED -2
@@ -66,6 +66,21 @@ typedef struct tr_stage_executor_load_params {
     uint32_t    spill_layer_count;
     const uint8_t * spill_devices_ptr;
     size_t      spill_devices_len;
+    // ABI v9: KV Cache Policy (per-model, stamped in the layer manifest).
+    // cache_type_k / cache_type_v name ggml types for the KV cache ("f16",
+    // "bf16", "f32", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"). Empty selects
+    // f16 (the pre-v9 behavior). Requesting any non-f16 type also enables
+    // flash attention (quantized caches require it); if the context cannot be
+    // created with the requested types plus flash attention the load FAILS -
+    // never a silent f16 fallback, which would allocate a larger cache than
+    // the layer solver budgeted and OOM exactly the tight fits the budget
+    // exists to protect. Capabilities echo the applied types (cache_type_k,
+    // cache_type_v; empty on metadata-only loads, which create no cache) so
+    // the runtime can verify requested == applied at warmup.
+    const uint8_t * cache_type_k_ptr;
+    size_t      cache_type_k_len;
+    const uint8_t * cache_type_v_ptr;
+    size_t      cache_type_v_len;
 } tr_stage_executor_load_params;
 
 typedef struct tr_stage_executor_slot_input {

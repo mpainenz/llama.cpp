@@ -2189,6 +2189,25 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // TensorRelay stage shards declare the FULL model's block_count but hold
+    // only [first_layer, last_layer_exclusive). Without a filter every stage
+    // allocates KV cells for every declared layer - each member paying the
+    // whole model's KV footprint for layers it never executes - which the
+    // layer solver does not budget (it charges per RESIDENT layer). Compose
+    // with any arch-specific filter; non-stage models pass through untouched.
+    const auto tensorrelay_stage_kv_filter =
+        [this](llama_memory_i::layer_filter_cb prev) -> llama_memory_i::layer_filter_cb {
+        if (!tensorrelay_stage) {
+            return prev;
+        }
+        if (!prev) {
+            return [this](int32_t il) { return tensorrelay_layer_in_stage(il); };
+        }
+        return [this, prev = std::move(prev)](int32_t il) {
+            return prev(il) && tensorrelay_layer_in_stage(il);
+        };
+    };
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2270,6 +2289,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    // Stage shards only pay memory for their resident layers.
+                    // Compose ONLY with explicitly-set filters: a null filter
+                    // makes the hybrid caches substitute their is_recr-based
+                    // attn/recr split internally, which a bare stage filter
+                    // would clobber. Every split-capable hybrid arch (qwen35,
+                    // qwen35moe) sets both filters above, so a stage load
+                    // always composes here.
+                    if (filter_attn) {
+                        filter_attn = tensorrelay_stage_kv_filter(std::move(filter_attn));
+                    }
+                    if (filter_recr) {
+                        filter_recr = tensorrelay_stage_kv_filter(std::move(filter_recr));
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -2338,6 +2371,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
                         }
                     }
+
+                    // Stage shards only pay memory for their resident layers
+                    // (a null filter means "all layers" for these caches, so
+                    // the stage filter composes with or replaces it safely).
+                    filter = tensorrelay_stage_kv_filter(std::move(filter));
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
