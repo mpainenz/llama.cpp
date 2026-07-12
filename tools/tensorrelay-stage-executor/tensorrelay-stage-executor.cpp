@@ -72,6 +72,10 @@ struct tr_stage_executor_state {
     uint32_t    slot_count = 0;
     uint32_t    context_length = 0;
     uint32_t    pos_streams = 1;
+    // ABI v8 tail-spill; retained for capabilities reporting.
+    uint32_t    spill_layer_count = 0;
+    std::string spill_devices;
+    std::string spill_engine_applied;
     bool        loaded = false;
     std::vector<std::string> device_names;
     std::vector<uint64_t> slot_epochs;
@@ -638,6 +642,10 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         { "activation_output", state->split_count > 1 && !is_final_stage },
         { "sampled_token_output", state->split_count > 1 && is_final_stage },
         { "final_text_output", single_stage_request_json || (split_graph_execution && is_final_stage) },
+        // ABI v8: build capability plus the current load's applied spill echo.
+        { "supports_layer_spill", true },
+        { "spill_layer_count", state->spill_layer_count },
+        { "spill_devices", state->spill_engine_applied },
         { "reason", reason },
     };
     out = capabilities.dump();
@@ -1348,6 +1356,93 @@ static bool resolve_selected_devices(
     return true;
 }
 
+// ABI v8: resolve the buffer type that spilled tail tensors are placed on. An
+// empty selector means the CPU (system-RAM) buffer type; otherwise it names a
+// single ggml device (e.g. an iGPU) whose default buffer type is used. Must be
+// called after ggml_backend_load_all().
+// ABI v8: resolves the spill selector. Empty or naming the CPU device selects
+// CPU spill (out_dev nullptr, CPU buffer type); otherwise the named GPU device
+// and its buffer type. Unknown names are errors. Must be called after
+// ggml_backend_load_all().
+static bool resolve_spill_target(
+        const std::string & spill_devices,
+        ggml_backend_dev_t & out_dev,
+        ggml_backend_buffer_type_t & out_buft,
+        std::string & error) {
+    out_dev = nullptr;
+    out_buft = ggml_backend_cpu_buffer_type();
+    std::string trimmed = spill_devices;
+    trimmed.erase(0, trimmed.find_first_not_of(" \t\r\n"));
+    trimmed.erase(trimmed.find_last_not_of(" \t\r\n") + 1);
+    if (trimmed.empty()) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(trimmed.c_str());
+    if (dev == nullptr) {
+        error = "spill device is not available: " + trimmed +
+            " (available devices: " + available_gpu_device_names() + ")";
+        return false;
+    }
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (buft == nullptr) {
+        error = "spill device has no buffer type: " + trimmed;
+        return false;
+    }
+    out_dev = dev;
+    out_buft = buft;
+    return true;
+}
+
+// ABI v8: override list pinning the stage's spilled tail onto spill_buft. A
+// stage shard keeps the model's ORIGINAL block indices and declares the full
+// model's block_count, so the tail is the last `spill_layer_count` blocks of
+// [first_layer, last_layer_exclusive). On the final stage the output head
+// follows the tail (ADR-0018); tied-embedding models have no output.* tensors
+// (their lm_head is a duplicated token_embd, which llama keeps on the CPU
+// input device - already system memory), so the head patterns match nothing
+// there. When head_buft is non-null (GPU spill target in the compute set) the
+// head blocks are pinned so the layer split cannot migrate them onto the
+// spill device; token_embd needs no pin (llama always places it on the CPU
+// input device). out_patterns owns the strings referenced by out_overrides;
+// the pointers are taken only after every push, and both vectors must outlive
+// llama_model_load_from_file. The list is NULL-terminated.
+static void build_spill_overrides(
+        uint32_t first_layer,
+        uint32_t last_layer_exclusive,
+        uint32_t spill_layer_count,
+        bool is_final_stage,
+        ggml_backend_buffer_type_t spill_buft,
+        ggml_backend_buffer_type_t head_buft,
+        std::vector<std::string> & out_patterns,
+        std::vector<llama_model_tensor_buft_override> & out_overrides) {
+    out_patterns.clear();
+    out_overrides.clear();
+    const uint32_t tail_start = last_layer_exclusive - spill_layer_count;
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    for (uint32_t blk = first_layer; blk < last_layer_exclusive; ++blk) {
+        const bool spilled = blk >= tail_start;
+        if (!spilled && head_buft == nullptr) {
+            continue; // head stays on the discrete device via n_gpu_layers
+        }
+        out_patterns.push_back("^blk\\." + std::to_string(blk) + "\\.");
+        bufts.push_back(spilled ? spill_buft : head_buft);
+    }
+    if (is_final_stage && spill_layer_count > 0) {
+        out_patterns.push_back("^output\\.");
+        bufts.push_back(spill_buft);
+        out_patterns.push_back("^output_norm\\.");
+        bufts.push_back(spill_buft);
+    }
+    out_overrides.reserve(out_patterns.size() + 1);
+    for (size_t i = 0; i < out_patterns.size(); ++i) {
+        out_overrides.push_back({ out_patterns[i].c_str(), bufts[i] });
+    }
+    out_overrides.push_back({ nullptr, nullptr });
+}
+
 extern "C" {
 
 uint32_t tr_stage_executor_abi_version(void) {
@@ -1413,6 +1508,9 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
 
     reset_all_slot_samplers(state);
     state->slot_samplers.clear();
+    // A failed load below must not leave the handle looking loaded against a
+    // freed model/ctx, or report the previous load's spill in capabilities.
+    state->loaded = false;
     if (state->ctx != nullptr) {
         llama_free(state->ctx);
         state->ctx = nullptr;
@@ -1436,6 +1534,9 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     state->pos_streams = 1;
     state->vocab = nullptr;
     state->device_names.clear();
+    state->spill_layer_count = 0;
+    state->spill_devices = bytes_to_string(params->spill_devices_ptr, params->spill_devices_len);
+    state->spill_engine_applied.clear();
 
     state->split_unsound_reason.clear();
     if (params->split_count > 1 && is_split_graph_execution_architecture(metadata.architecture)) {
@@ -1456,13 +1557,80 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
             return set_error(state, device_error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
         }
         llama_model_params model_params = llama_model_default_params();
+        // These must outlive llama_model_load_from_file: it reads the override
+        // patterns (regex strings) and buft list during the load.
+        std::vector<std::string> spill_patterns;
+        std::vector<llama_model_tensor_buft_override> spill_overrides;
         if (devices.empty()) {
+            if (params->spill_layer_count > 0) {
+                return set_error(state,
+                    "spill requested but no discrete devices are selected",
+                    TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+            }
             model_params.n_gpu_layers = 0;
         } else {
             // with the default LLAMA_SPLIT_MODE_LAYER, llama_model_load_from_file copies
             // the device handles out of this NULL-terminated array, so the local vector
             // only has to stay alive for the duration of the call
             model_params.n_gpu_layers = 999;
+            // ABI v8 tail-spill. A solver-assigned spill must be applied
+            // exactly or the load must fail: a spill silently dropped or
+            // clamped loads a placement the solver never costed.
+            if (params->spill_layer_count > 0) {
+                const bool have_stage_range =
+                    state->last_layer_exclusive > state->first_layer &&
+                    state->last_layer_exclusive <= state->block_count;
+                if (!have_stage_range) {
+                    return set_error(state,
+                        "spill requested but the stage layer range metadata is missing or invalid",
+                        TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+                }
+                if (params->spill_layer_count > state->last_layer_exclusive - state->first_layer) {
+                    return set_error(state,
+                        "spill_layer_count exceeds the stage's layer count",
+                        TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+                }
+                std::string spill_error;
+                ggml_backend_dev_t spill_dev = nullptr;
+                ggml_backend_buffer_type_t spill_buft = nullptr;
+                if (!resolve_spill_target(state->spill_devices, spill_dev, spill_buft, spill_error)) {
+                    return set_error(state, spill_error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+                }
+                ggml_backend_buffer_type_t head_buft = nullptr;
+                if (spill_dev != nullptr) {
+                    // A GPU spill target only holds weights if it also joins the
+                    // compute device set (else ggml aborts on a tensor in a buffer
+                    // no scheduled backend can run); the CPU backend is always
+                    // present so a CPU tail needs no entry. Joining the set means
+                    // the head must be pinned so the layer split cannot migrate it
+                    // onto the spill device - which only supports a single head
+                    // device, and the spill device must not already be selected
+                    // (a duplicate handle double-counts in the layer split).
+                    if (devices.size() != 2) {
+                        return set_error(state,
+                            "GPU spill requires exactly one selected head device",
+                            TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+                    }
+                    if (devices.front() == spill_dev) {
+                        return set_error(state,
+                            "spill device must not be one of the selected devices",
+                            TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+                    }
+                    head_buft = ggml_backend_dev_buffer_type(devices.front());
+                    devices.back() = spill_dev; // overwrite the NULL terminator
+                    devices.push_back(nullptr);
+                }
+                const bool is_final_stage = params->stage_index == params->split_count - 1;
+                build_spill_overrides(
+                    state->first_layer, state->last_layer_exclusive, params->spill_layer_count,
+                    is_final_stage, spill_buft, head_buft, spill_patterns, spill_overrides);
+                model_params.tensor_buft_overrides = spill_overrides.data();
+                state->spill_layer_count = params->spill_layer_count;
+                state->spill_engine_applied =
+                    spill_dev != nullptr ? ggml_backend_dev_name(spill_dev) : "cpu";
+            }
+            // Set last: a GPU spill target may have push_back'd onto `devices`,
+            // reallocating it, so bind the pointer only after the final layout.
             model_params.devices = devices.data();
         }
         state->model = llama_model_load_from_file(state->shard_path.c_str(), model_params);
@@ -1884,6 +2052,7 @@ int32_t tr_stage_executor_enumerate_devices(
             { "name", name == nullptr ? "" : name },
             { "backend", backend_name == nullptr ? "" : backend_name },
             { "description", description == nullptr ? "" : description },
+            { "device_type", type == GGML_BACKEND_DEVICE_TYPE_IGPU ? "igpu" : "gpu" },
             { "memory_total_mb", std::min<uint64_t>(total_bytes / (1024u * 1024u), max_mb) },
             { "memory_free_mb", std::min<uint64_t>(free_bytes / (1024u * 1024u), max_mb) },
         });

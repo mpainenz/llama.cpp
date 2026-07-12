@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 7u
+#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 8u
 #define TENSORRELAY_STAGE_EXECUTOR_OK 0
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT -1
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED -2
@@ -46,6 +46,26 @@ typedef struct tr_stage_executor_load_params {
     size_t      shard_path_len;
     const uint8_t * selected_devices_ptr;
     size_t      selected_devices_len;
+    // ABI v8: tail-spill (ADR-0018 Layer Spill). The last spill_layer_count
+    // blocks of this stage - and the output head when this is the final stage -
+    // are placed on spill_devices instead of the discrete selected_devices.
+    // spill_layer_count 0 preserves v7 behavior (nothing spilled). An empty
+    // spill_devices string selects the CPU (system-RAM) buffer type; otherwise
+    // it names a single ggml device (e.g. an iGPU) whose buffer type receives
+    // the spilled tensors. A nonzero request is applied exactly or the load
+    // fails with ERR_INVALID_ARGUMENT: metadata-only or CPU-only selections,
+    // a missing/invalid stage layer range, a count above the stage's span, an
+    // unknown spill device, a GPU spill with multiple selected head devices,
+    // or a spill device that is already selected are all errors. Capabilities
+    // echo the applied spill (spill_layer_count, spill_devices). Notes: KV
+    // cache for spilled blocks stays on the head device (llama places KV by
+    // layer-split assignment, not weight overrides) - capacity accounting
+    // must charge spilled-block KV to the head; tied-embedding models have no
+    // output.* tensors, so the final-stage head remains with token_embd on
+    // the CPU input device (already system memory).
+    uint32_t    spill_layer_count;
+    const uint8_t * spill_devices_ptr;
+    size_t      spill_devices_len;
 } tr_stage_executor_load_params;
 
 typedef struct tr_stage_executor_slot_input {
@@ -157,10 +177,13 @@ TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_benchmark(
 // ABI v7: enumerates the ggml backend devices that are actually loadable in
 // this process right now (after ggml_backend_load_all). Works on a freshly
 // created executor before any load. Writes a UTF-8 JSON array of
-// {name, backend, description, memory_total_mb, memory_free_mb} objects, one
-// per GPU/iGPU device (CPU and accelerator devices are omitted). Two-call
-// pattern: with out_ptr NULL or out_cap 0 only *out_len is set to the
-// required byte count; otherwise the JSON is copied when it fits.
+// {name, backend, description, device_type, memory_total_mb, memory_free_mb}
+// objects, one per GPU/iGPU device (CPU and accelerator devices are omitted).
+// ABI v8: device_type is "gpu" (discrete) or "igpu" (integrated), read from
+// the ggml device type - the client no longer has to guess integrated vs.
+// discrete from the description string. Two-call pattern: with out_ptr NULL or
+// out_cap 0 only *out_len is set to the required byte count; otherwise the JSON
+// is copied when it fits.
 TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_enumerate_devices(
     void * handle,
     uint8_t * out_ptr,
