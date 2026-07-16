@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 9u
+#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 10u
 #define TENSORRELAY_STAGE_EXECUTOR_OK 0
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT -1
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED -2
@@ -26,7 +26,10 @@ extern "C" {
 // ABI v6: hard cap on tr_stage_executor_benchmark decode steps.
 #define TENSORRELAY_STAGE_EXECUTOR_BENCHMARK_MAX_STEPS 16u
 
-#define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_REQUEST_JSON (1u << 0)
+// (1u << 0) was INPUT_FLAG_REQUEST_JSON: the single-stage one-shot blob path,
+// retired in ABI v10. Single-stage execution now uses the same token loop as
+// split stages (token ids in, one sampled token out per call). The bit stays
+// reserved so old callers fail the version check instead of aliasing a flag.
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_FINAL_CHUNK  (1u << 1)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_TOKEN_IDS    (1u << 2)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_ACTIVATIONS  (1u << 3)
@@ -158,17 +161,50 @@ TENSORRELAY_STAGE_EXECUTOR_API size_t   tr_stage_executor_capabilities_json(
     uint8_t * out_ptr,
     size_t out_len);
 TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_execute_batch(void * handle, tr_stage_executor_batch_call * call);
-// ABI v4: applies the loaded model chat template to an OpenAI-style request JSON payload
-// and tokenizes the result. out_token_count is always set to the required token count on
-// success; token ids are written only when out_tokens_ptr is non-NULL and out_tokens_cap
-// >= *out_token_count. Callers use the two-call pattern (probe with cap 0, then fill).
-TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_tokenize(
+// ABI v10: renders the loaded model chat template for an OpenAI chat-completions
+// request JSON (messages[], optional tools[]/tool_choice/parallel_tool_calls) and
+// tokenizes the result. Replaces the v4 tr_stage_executor_tokenize entry, which
+// rendered through the tools-blind legacy template path.
+//
+// Two outputs, both two-call pattern: on success *out_token_count and
+// *out_state_len are always set to the required sizes; token ids and the state
+// JSON are written only when the matching buffer is present and large enough.
+// The state JSON is the Chat Format Handle: an opaque blob the caller must pass
+// back verbatim to tr_stage_executor_chat_parse for this generation. It also
+// carries "additional_stops" (format-implied stop strings the caller must
+// enforce; the token loop does not scan text) and "prompt_token_count".
+// tool_choice may be absent, "auto", or "none" - the caller rejects "required"
+// and named-function forcing before this entry is reached (no grammar
+// constraining in v10).
+TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_chat_begin(
     void * handle,
     const uint8_t * request_json_ptr,
     size_t request_json_len,
     int32_t * out_tokens_ptr,
     size_t out_tokens_cap,
-    size_t * out_token_count);
+    size_t * out_token_count,
+    uint8_t * out_state_ptr,
+    size_t out_state_cap,
+    size_t * out_state_len);
+// ABI v10: parses accumulated generated text into structured chat state using
+// the Chat Format Handle from tr_stage_executor_chat_begin. is_partial nonzero
+// while generation is still running (the parser then tolerates and heals
+// incomplete syntax); zero for the final call. Writes a JSON object
+// {"content","reasoning_content","tool_calls":[{"id","name","arguments"}]}
+// reflecting the ENTIRE text so far - the caller diffs successive states into
+// streaming deltas. Two-call pattern via out_ptr/out_cap/out_len. Reads only
+// its arguments (no llama state) but serializes on the executor mutex like
+// every other entry.
+TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_chat_parse(
+    void * handle,
+    const uint8_t * state_json_ptr,
+    size_t state_json_len,
+    const uint8_t * text_ptr,
+    size_t text_len,
+    uint32_t is_partial,
+    uint8_t * out_ptr,
+    size_t out_cap,
+    size_t * out_len);
 // ABI v5: installs the sampler chain used for final-stage sampling of the
 // given (slot, request epoch). Stale epochs (older than the slot's current
 // epoch) are rejected. Reconfiguring replaces any previous chain for the slot.

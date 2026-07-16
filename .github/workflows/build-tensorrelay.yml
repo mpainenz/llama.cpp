@@ -76,7 +76,7 @@ jobs:
           # Verify the full stage executor ABI is exported
           for sym in abi_version create destroy load alloc_slots \
             activation_descriptor_json capabilities_json execute_batch \
-            release_slot last_error tokenize; do
+            release_slot last_error chat_begin chat_parse; do
             nm -D dist/libtensorrelay_stage_executor.so | grep -q " tr_stage_executor_${sym}$" \
               || { echo "::error::Missing ABI export tr_stage_executor_${sym}"; exit 1; }
           done

@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama.h"
+#include "chat.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -88,6 +89,10 @@ struct tr_stage_executor_state {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
+    // ABI v10: tools-aware chat templating (common/chat.h). Initialized on
+    // load whenever a llama model is present; null on metadata-only loads or
+    // when the model carries no usable template.
+    common_chat_templates_ptr chat_templates;
 };
 
 static std::once_flag backend_init_once;
@@ -606,24 +611,23 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
 
     const bool is_first_stage = state->stage_index == 0;
     const bool is_final_stage = state->stage_index == state->split_count - 1;
-    const bool single_stage_request_json =
-            state->split_count == 1 &&
+    const bool runtime_ready =
             state->model != nullptr &&
-            state->ctx != nullptr &&
-            state->vocab != nullptr;
+            state->ctx != nullptr;
     const bool split_arch_supported =
             is_split_graph_execution_architecture(state->architecture) &&
             state->split_unsound_reason.empty();
+    // ABI v10: the token loop is the only execution path. A single-stage load
+    // runs it for any loadable architecture; multi-stage loads additionally
+    // need split-graph architecture support and a sound stage layout.
     const bool split_graph_execution =
-            state->split_count > 1 &&
-            split_arch_supported &&
-            state->model != nullptr &&
-            state->ctx != nullptr;
+            runtime_ready &&
+            (state->split_count == 1 || split_arch_supported);
     const std::string reason = [&]() {
-        if (single_stage_request_json) {
-            return std::string("single-stage request-json execution is available");
-        }
-        if (state->split_count <= 1) {
+        if (state->split_count == 1) {
+            if (split_graph_execution) {
+                return std::string("single-stage token-loop execution is available");
+            }
             return std::string("single-stage llama runtime is not initialized");
         }
         if (!is_split_graph_execution_architecture(state->architecture)) {
@@ -654,13 +658,13 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         { "devices", state->device_names },
         { "is_first_stage", is_first_stage },
         { "is_final_stage", is_final_stage },
-        { "single_stage_request_json", single_stage_request_json },
+        { "chat_entries", state->chat_templates != nullptr },
         { "split_graph_execution", split_graph_execution },
-        { "token_input", state->split_count > 1 && is_first_stage },
-        { "activation_input", state->split_count > 1 && !is_first_stage },
-        { "activation_output", state->split_count > 1 && !is_final_stage },
-        { "sampled_token_output", state->split_count > 1 && is_final_stage },
-        { "final_text_output", single_stage_request_json || (split_graph_execution && is_final_stage) },
+        { "token_input", is_first_stage },
+        { "activation_input", !is_first_stage },
+        { "activation_output", !is_final_stage },
+        { "sampled_token_output", is_final_stage },
+        { "final_text_output", is_final_stage },
         // ABI v8: build capability plus the current load's applied spill echo.
         { "supports_layer_spill", true },
         { "spill_layer_count", state->spill_layer_count },
@@ -674,107 +678,6 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
     };
     out = capabilities.dump();
     return true;
-}
-
-static int request_max_tokens(const json & body) {
-    int max_tokens = 128;
-    const auto read_int = [&](const char * key, int current) {
-        if (!body.contains(key) || !body.at(key).is_number_integer()) {
-            return current;
-        }
-        return body.at(key).get<int>();
-    };
-    max_tokens = read_int("max_tokens", max_tokens);
-    max_tokens = read_int("max_completion_tokens", max_tokens);
-    return std::max(1, std::min(max_tokens, 512));
-}
-
-static std::string content_to_text(const json & content) {
-    if (content.is_string()) {
-        return content.get<std::string>();
-    }
-    if (!content.is_array()) {
-        return {};
-    }
-    std::string out;
-    for (const auto & part : content) {
-        if (!part.is_object()) {
-            continue;
-        }
-        if (part.contains("text") && part.at("text").is_string()) {
-            if (!out.empty()) {
-                out += "\n";
-            }
-            out += part.at("text").get<std::string>();
-        }
-    }
-    return out;
-}
-
-static bool request_to_prompt(
-        llama_model * model,
-        const std::string & payload,
-        std::string & prompt,
-        int & max_tokens,
-        std::string & error) {
-    json body;
-    try {
-        body = json::parse(payload);
-    } catch (const std::exception & e) {
-        error = std::string("invalid OpenAI request JSON: ") + e.what();
-        return false;
-    }
-
-    max_tokens = request_max_tokens(body);
-
-    if (body.contains("prompt") && body.at("prompt").is_string()) {
-        prompt = body.at("prompt").get<std::string>();
-        return !prompt.empty();
-    }
-
-    if (!body.contains("messages") || !body.at("messages").is_array()) {
-        error = "OpenAI request JSON must contain messages[] or prompt";
-        return false;
-    }
-
-    std::vector<std::pair<std::string, std::string>> owned_messages;
-    for (const auto & item : body.at("messages")) {
-        if (!item.is_object()) {
-            continue;
-        }
-        const std::string role = item.contains("role") && item.at("role").is_string()
-            ? item.at("role").get<std::string>()
-            : "user";
-        const std::string content = item.contains("content") ? content_to_text(item.at("content")) : std::string();
-        if (!content.empty()) {
-            owned_messages.emplace_back(role, content);
-        }
-    }
-    if (owned_messages.empty()) {
-        error = "OpenAI request JSON messages[] did not contain text content";
-        return false;
-    }
-
-    std::vector<llama_chat_message> chat;
-    chat.reserve(owned_messages.size());
-    for (const auto & item : owned_messages) {
-        chat.push_back({ item.first.c_str(), item.second.c_str() });
-    }
-
-    const char * tmpl = llama_model_chat_template(model, nullptr);
-    int formatted_len = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, nullptr, 0);
-    if (formatted_len < 0) {
-        error = "failed to apply model chat template";
-        return false;
-    }
-    std::vector<char> formatted(static_cast<size_t>(formatted_len) + 1);
-    formatted_len = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, formatted.data(), formatted.size());
-    if (formatted_len < 0) {
-        error = "failed to apply model chat template";
-        return false;
-    }
-    prompt.assign(formatted.data(), static_cast<size_t>(formatted_len));
-    return !prompt.empty();
 }
 
 static bool token_to_piece(const llama_vocab * vocab, llama_token token, std::string & piece, std::string & error) {
@@ -793,42 +696,6 @@ static bool token_to_piece(const llama_vocab * vocab, llama_token token, std::st
     piece.assign(buf.data(), static_cast<size_t>(n));
     return true;
 }
-
-struct token_batch_storage {
-    std::vector<llama_token> tokens;
-    std::vector<llama_pos> positions;
-    std::vector<int32_t> n_seq_ids;
-    std::vector<llama_seq_id> seq_ids;
-    std::vector<llama_seq_id *> seq_id_ptrs;
-    std::vector<int8_t> logits;
-    llama_batch batch{};
-
-    void reset(const std::vector<llama_token> & input_tokens, llama_seq_id seq_id, llama_pos pos_start) {
-        tokens = input_tokens;
-        positions.resize(tokens.size());
-        n_seq_ids.assign(tokens.size(), 1);
-        seq_ids.assign(tokens.size(), seq_id);
-        seq_id_ptrs.resize(tokens.size());
-        logits.assign(tokens.size(), 0);
-
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            positions[i] = pos_start + static_cast<llama_pos>(i);
-            seq_id_ptrs[i] = &seq_ids[i];
-        }
-        if (!logits.empty()) {
-            logits.back() = 1;
-        }
-
-        batch = {};
-        batch.n_tokens = static_cast<int32_t>(tokens.size());
-        batch.token = tokens.data();
-        batch.embd = nullptr;
-        batch.pos = positions.data();
-        batch.n_seq_id = n_seq_ids.data();
-        batch.seq_id = seq_id_ptrs.data();
-        batch.logits = logits.data();
-    }
-};
 
 struct split_batch_storage {
     std::vector<llama_token> tokens;
@@ -880,7 +747,6 @@ struct split_batch_storage {
         }
 
         size_t cursor = 0;
-        uint32_t output_ordinal = 0;
         for (uint32_t i = 0; i < call->input_count; ++i) {
             const auto & input = call->inputs_ptr[i];
             const llama_seq_id seq_id = static_cast<llama_seq_id>(input.slot_id);
@@ -940,11 +806,9 @@ struct split_batch_storage {
                 // through output_ids), not an output ordinal: record the index
                 // of each input's sampled (last) token.
                 output_ordinals.push_back(static_cast<uint32_t>(cursor + input.token_count - 1));
-                output_ordinal++;
             } else {
                 for (uint32_t j = 0; j < input.token_count; ++j) {
                     logits[cursor + j] = 1;
-                    output_ordinal++;
                 }
             }
             cursor += input.token_count;
@@ -1025,183 +889,27 @@ static llama_sampler * configured_slot_sampler(
     return slot.sampler;
 }
 
-// Extracts the per-request sampling parameters from an OpenAI request body.
-// Absent fields keep the executor's historical defaults (min_p 0.05, temp 0.8,
-// random seed), so requests without sampling fields behave exactly as before.
-// temperature <= 0 selects deterministic greedy decoding, matching the
-// split-stage tr_stage_executor_configure_slot_sampler contract.
-static tr_stage_executor_sampler_params single_stage_sampler_params(const json & body) {
-    tr_stage_executor_sampler_params params = {};
-    params.abi_version = TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION;
-    params.temperature = 0.8f;
-    params.top_p       = 1.0f;
-    params.min_p       = 0.05f;
-    params.top_k       = 0;
-    params.seed        = LLAMA_DEFAULT_SEED;
-
-    const auto read_float = [&](const char * key, float current) {
-        if (!body.contains(key) || !body.at(key).is_number()) {
-            return current;
-        }
-        const float value = body.at(key).get<float>();
-        return std::isfinite(value) ? value : current;
-    };
-    params.temperature = read_float("temperature", params.temperature);
-    params.top_p       = read_float("top_p", params.top_p);
-    params.min_p       = read_float("min_p", params.min_p);
-    if (body.contains("top_k") && body.at("top_k").is_number_integer()) {
-        params.top_k = body.at("top_k").get<int32_t>();
-    }
-    if (body.contains("seed") && body.at("seed").is_number_integer()) {
-        const int64_t seed = body.at("seed").get<int64_t>();
-        if (seed >= 0) {
-            params.seed = static_cast<uint32_t>(seed & 0xFFFFFFFFll);
-        }
-    }
-    return params;
-}
-
-// OpenAI "stop": a single string or an array of strings; empty entries are
-// ignored. Generated text is truncated at the earliest stop match.
-static std::vector<std::string> request_stop_strings(const json & body) {
-    std::vector<std::string> stops;
-    if (!body.contains("stop")) {
-        return stops;
-    }
-    const auto & stop = body.at("stop");
-    if (stop.is_string()) {
-        std::string value = stop.get<std::string>();
-        if (!value.empty()) {
-            stops.push_back(std::move(value));
-        }
-        return stops;
-    }
-    if (stop.is_array()) {
-        for (const auto & item : stop) {
-            if (!item.is_string()) {
-                continue;
-            }
-            std::string value = item.get<std::string>();
-            if (!value.empty()) {
-                stops.push_back(std::move(value));
-            }
-        }
-    }
-    return stops;
-}
-
-static bool generate_single_stage(
-        tr_stage_executor_state * state,
-        uint32_t slot_id,
-        const std::string & payload,
-        std::string & out,
-        std::string & error) {
-    if (state->model == nullptr || state->ctx == nullptr || state->vocab == nullptr) {
-        error = "single-stage llama runtime is not initialized";
-        return false;
-    }
-
-    std::string prompt;
-    int max_tokens = 0;
-    if (!request_to_prompt(state->model, payload, prompt, max_tokens, error)) {
-        return false;
-    }
-
-    // request_to_prompt() already rejected malformed JSON, so this re-parse
-    // only extracts the optional sampling/stop fields.
-    const json body = json::parse(payload);
-    const tr_stage_executor_sampler_params sampler_params = single_stage_sampler_params(body);
-    const std::vector<std::string> stop_strings = request_stop_strings(body);
-
-    const llama_seq_id seq_id = static_cast<llama_seq_id>(slot_id);
-    llama_memory_seq_rm(llama_get_memory(state->ctx), seq_id, -1, -1);
-
-    const int n_prompt = -llama_tokenize(
-        state->vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
-    if (n_prompt <= 0) {
-        error = "failed to tokenize prompt";
-        return false;
-    }
-    if (n_prompt + max_tokens > static_cast<int>(llama_n_ctx(state->ctx))) {
-        error = "prompt and requested output exceed executor context length";
-        return false;
-    }
-
-    std::vector<llama_token> prompt_tokens(static_cast<size_t>(n_prompt));
-    if (llama_tokenize(
-            state->vocab,
-            prompt.c_str(),
-            static_cast<int32_t>(prompt.size()),
-            prompt_tokens.data(),
-            static_cast<int32_t>(prompt_tokens.size()),
-            true,
-            true) < 0) {
-        error = "failed to tokenize prompt";
-        return false;
-    }
-
-    llama_sampler * sampler = create_sampler_from_params(sampler_params);
-    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler_guard(sampler, llama_sampler_free);
-
-    token_batch_storage batch;
-    batch.reset(prompt_tokens, seq_id, 0);
-    llama_token next_token = LLAMA_TOKEN_NULL;
-    for (int i = 0; i < max_tokens; ++i) {
-        const int decode_rc = llama_decode(state->ctx, batch.batch);
-        if (decode_rc != 0) {
-            error = "llama_decode failed with code " + std::to_string(decode_rc);
-            return false;
-        }
-
-        next_token = llama_sampler_sample(sampler, state->ctx, -1);
-        if (llama_vocab_is_eog(state->vocab, next_token)) {
-            break;
-        }
-        std::string piece;
-        if (!token_to_piece(state->vocab, next_token, piece, error)) {
-            return false;
-        }
-        out += piece;
-
-        // Stop strings: truncate at the earliest match (a match may span token
-        // boundaries, so search the accumulated text) and stop generating.
-        size_t stop_pos = std::string::npos;
-        for (const auto & stop : stop_strings) {
-            const size_t search_from = out.size() >= piece.size() + stop.size() - 1
-                ? out.size() - piece.size() - (stop.size() - 1)
-                : 0;
-            const size_t pos = out.find(stop, search_from);
-            if (pos != std::string::npos && pos < stop_pos) {
-                stop_pos = pos;
-            }
-        }
-        if (stop_pos != std::string::npos) {
-            out.erase(stop_pos);
-            break;
-        }
-
-        batch.reset({ next_token }, seq_id, static_cast<llama_pos>(prompt_tokens.size() + i));
-    }
-
-    return true;
-}
-
 static bool execute_split_stage(
         tr_stage_executor_state * state,
         tr_stage_executor_batch_call * call,
         std::string & error) {
     if (state->model == nullptr || state->ctx == nullptr) {
-        error = "split-stage llama runtime is not initialized";
+        error = "stage llama runtime is not initialized";
         return false;
     }
-    if (!is_split_graph_execution_architecture(state->architecture)) {
-        error = "split-stage graph execution is not available for architecture " + state->architecture;
-        return false;
-    }
-    if (!state->split_unsound_reason.empty()) {
-        error = "split-stage graph execution is not available for this model/stage layout: " +
-            state->split_unsound_reason;
-        return false;
+    // Split-graph architecture constraints only exist at real stage
+    // boundaries; a single-stage load is a whole model and any loadable
+    // architecture runs the token loop.
+    if (state->split_count > 1) {
+        if (!is_split_graph_execution_architecture(state->architecture)) {
+            error = "split-stage graph execution is not available for architecture " + state->architecture;
+            return false;
+        }
+        if (!state->split_unsound_reason.empty()) {
+            error = "split-stage graph execution is not available for this model/stage layout: " +
+                state->split_unsound_reason;
+            return false;
+        }
     }
 
     const bool is_final_stage = state->stage_index == state->split_count - 1;
@@ -1547,6 +1255,7 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     // A failed load below must not leave the handle looking loaded against a
     // freed model/ctx, or report the previous load's spill in capabilities.
     state->loaded = false;
+    state->chat_templates.reset();
     if (state->ctx != nullptr) {
         llama_free(state->ctx);
         state->ctx = nullptr;
@@ -1720,6 +1429,16 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         const llama_rope_type rope_type = llama_model_rope_type(state->model);
         state->pos_streams =
             (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+
+        // ABI v10: tools-aware chat templating. Any stage GGUF carries the full
+        // tokenizer/chat-template KV map, so every caller renders chat requests
+        // through its local executor. A model without a usable template leaves
+        // this null and chat_begin fails loudly.
+        try {
+            state->chat_templates = common_chat_templates_init(state->model, "");
+        } catch (const std::exception &) {
+            state->chat_templates.reset();
+        }
     }
 
     state->loaded = true;
@@ -1823,115 +1542,240 @@ int32_t tr_stage_executor_execute_batch(void * handle, tr_stage_executor_batch_c
     if (call->output_bytes_ptr == nullptr || call->output_bytes_len == 0) {
         return set_error(state, "batch output byte buffer is required", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
-    if (state->split_count != 1) {
-        std::string error;
-        if (!execute_split_stage(state, call, error)) {
-            const int32_t code =
-                is_split_graph_execution_architecture(state->architecture) &&
-                state->split_unsound_reason.empty()
-                ? TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT
-                : TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED;
-            return set_error(state, error, code);
-        }
-        state->last_error.clear();
-        return TENSORRELAY_STAGE_EXECUTOR_OK;
+    std::string error;
+    if (!execute_split_stage(state, call, error)) {
+        const int32_t code =
+            state->split_count == 1 ||
+            (is_split_graph_execution_architecture(state->architecture) &&
+             state->split_unsound_reason.empty())
+            ? TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT
+            : TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED;
+        return set_error(state, error, code);
     }
-
-    size_t output_cursor = 0;
-    for (uint32_t i = 0; i < call->input_count; ++i) {
-        const auto & input = call->inputs_ptr[i];
-        auto & output = call->outputs_ptr[i];
-        const auto * input_begin = call->input_bytes_ptr + input.activation_offset;
-        const std::string input_payload(reinterpret_cast<const char *>(input_begin), input.activation_len);
-        std::string payload;
-        std::string error;
-
-        if ((input.flags & TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_REQUEST_JSON) == 0) {
-            return set_error(
-                state,
-                "single-stage execution requires OpenAI request JSON input",
-                TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
-        }
-        if (!generate_single_stage(state, input.slot_id, input_payload, payload, error)) {
-            return set_error(state, error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
-        }
-        output.flags = TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_FINAL_TEXT;
-        output.sampled_token_id = -1;
-
-        if (output_cursor + payload.size() > call->output_bytes_len) {
-            return set_error(state, "batch output buffer is too small", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
-        }
-        std::memcpy(call->output_bytes_ptr + output_cursor, payload.data(), payload.size());
-        output.slot_id = input.slot_id;
-        output.request_epoch = input.request_epoch;
-        output.activation_offset = static_cast<uint32_t>(output_cursor);
-        output.activation_len = static_cast<uint32_t>(payload.size());
-        output_cursor += payload.size();
-        state->slot_epochs[input.slot_id] = std::max(state->slot_epochs[input.slot_id], input.request_epoch);
-    }
-
     state->last_error.clear();
     return TENSORRELAY_STAGE_EXECUTOR_OK;
 }
 
-// ABI v4 tokenization entry point. Any stage GGUF carries the full tokenizer/chat-template
-// KV map, so every runtime node can tokenize a normalized OpenAI request via its local
-// executor even when its stage does not own token embeddings or output tensors.
-int32_t tr_stage_executor_tokenize(
+// ABI v10 chat templating entry point (replaces the v4 tokenize entry). Any
+// stage GGUF carries the full tokenizer/chat-template KV map, so every runtime
+// node can render and tokenize a chat request via its local executor even when
+// its stage does not own token embeddings or output tensors. Tools render
+// through the jinja path (common_chat_templates_apply); the returned state
+// JSON is the Chat Format Handle consumed by tr_stage_executor_chat_parse.
+int32_t tr_stage_executor_chat_begin(
         void * handle,
         const uint8_t * request_json_ptr,
         size_t request_json_len,
         int32_t * out_tokens_ptr,
         size_t out_tokens_cap,
-        size_t * out_token_count) {
+        size_t * out_token_count,
+        uint8_t * out_state_ptr,
+        size_t out_state_cap,
+        size_t * out_state_len) {
     auto * state = as_state(handle);
-    if (state == nullptr || out_token_count == nullptr) {
+    if (state == nullptr || out_token_count == nullptr || out_state_len == nullptr) {
         return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
     }
     *out_token_count = 0;
+    *out_state_len = 0;
     if (request_json_ptr == nullptr || request_json_len == 0) {
-        return set_error(state, "tokenize request payload is empty", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        return set_error(state, "chat_begin request payload is empty", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!state->loaded || state->model == nullptr || state->vocab == nullptr) {
         return set_error(
             state,
-            "tokenize requires a loaded llama model with vocabulary",
+            "chat_begin requires a loaded llama model with vocabulary",
             TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED);
+    }
+    if (state->chat_templates == nullptr) {
+        return set_error(
+            state,
+            "loaded model does not carry a usable chat template",
+            TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED);
     }
 
     const std::string payload = bytes_to_string(request_json_ptr, request_json_len);
-    std::string prompt;
-    std::string error;
-    int max_tokens = 0;
-    if (!request_to_prompt(state->model, payload, prompt, max_tokens, error)) {
-        return set_error(state, error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    common_chat_params chat_params;
+    try {
+        const json body = json::parse(payload);
+        if (!body.contains("messages") || !body.at("messages").is_array()) {
+            return set_error(
+                state,
+                "chat request JSON must contain a messages[] array",
+                TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        }
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(body.at("messages"));
+        if (body.contains("tools") && !body.at("tools").is_null()) {
+            inputs.tools = common_chat_tools_parse_oaicompat(body.at("tools"));
+        }
+        if (body.contains("tool_choice") && !body.at("tool_choice").is_null()) {
+            // The runtime pre-rejects "required" and named-function forcing
+            // (no grammar constraining in v10); anything non-string or unknown
+            // is a caller error, not a silent default.
+            if (!body.at("tool_choice").is_string()) {
+                return set_error(
+                    state,
+                    "tool_choice must be a string in v10 (\"auto\" or \"none\")",
+                    TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+            }
+            inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(body.at("tool_choice").get<std::string>());
+        }
+        if (body.contains("parallel_tool_calls") && body.at("parallel_tool_calls").is_boolean()) {
+            inputs.parallel_tool_calls = body.at("parallel_tool_calls").get<bool>();
+        } else {
+            inputs.parallel_tool_calls = true;
+        }
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+        inputs.enable_thinking       = true;
+        inputs.add_generation_prompt = true;
+
+        chat_params = common_chat_templates_apply(state->chat_templates.get(), inputs);
+    } catch (const std::exception & e) {
+        return set_error(
+            state,
+            std::string("chat templating failed: ") + e.what(),
+            TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
 
+    const std::string & prompt = chat_params.prompt;
     const int n_prompt = -llama_tokenize(
         state->vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
     if (n_prompt <= 0) {
-        return set_error(state, "failed to tokenize prompt", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        return set_error(state, "failed to tokenize rendered prompt", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
+
+    std::string state_payload;
+    try {
+        const json state_json = {
+            { "handle_version", 1 },
+            { "chat_format", static_cast<int>(chat_params.format) },
+            { "chat_format_name", common_chat_format_name(chat_params.format) },
+            { "reasoning_format", common_reasoning_format_name(COMMON_REASONING_FORMAT_AUTO) },
+            { "generation_prompt", chat_params.generation_prompt },
+            { "chat_parser", chat_params.parser },
+            { "additional_stops", chat_params.additional_stops },
+            { "prompt_token_count", n_prompt },
+        };
+        state_payload = state_json.dump();
+    } catch (const std::exception & e) {
+        return set_error(
+            state,
+            std::string("failed to encode chat format state: ") + e.what(),
+            TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+
     *out_token_count = static_cast<size_t>(n_prompt);
-    if (out_tokens_ptr == nullptr || out_tokens_cap < static_cast<size_t>(n_prompt)) {
-        // probe call: report required capacity without writing token ids
+    *out_state_len = state_payload.size();
+    const bool fill_tokens = out_tokens_ptr != nullptr && out_tokens_cap >= static_cast<size_t>(n_prompt);
+    const bool fill_state = out_state_ptr != nullptr && out_state_cap >= state_payload.size();
+    if (!fill_tokens && !fill_state) {
+        // probe call: report required capacities without writing
         state->last_error.clear();
         return TENSORRELAY_STAGE_EXECUTOR_OK;
     }
 
-    static_assert(sizeof(llama_token) == sizeof(int32_t), "llama_token must remain 32-bit for the tokenize ABI");
-    if (llama_tokenize(
-            state->vocab,
-            prompt.c_str(),
-            static_cast<int32_t>(prompt.size()),
-            reinterpret_cast<llama_token *>(out_tokens_ptr),
-            static_cast<int32_t>(out_tokens_cap),
-            true,
-            true) < 0) {
-        *out_token_count = 0;
-        return set_error(state, "failed to tokenize prompt", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    static_assert(sizeof(llama_token) == sizeof(int32_t), "llama_token must remain 32-bit for the chat_begin ABI");
+    if (fill_tokens) {
+        if (llama_tokenize(
+                state->vocab,
+                prompt.c_str(),
+                static_cast<int32_t>(prompt.size()),
+                reinterpret_cast<llama_token *>(out_tokens_ptr),
+                static_cast<int32_t>(out_tokens_cap),
+                true,
+                true) < 0) {
+            *out_token_count = 0;
+            *out_state_len = 0;
+            return set_error(state, "failed to tokenize rendered prompt", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        }
     }
+    if (fill_state) {
+        std::memcpy(out_state_ptr, state_payload.data(), state_payload.size());
+    }
+    state->last_error.clear();
+    return TENSORRELAY_STAGE_EXECUTOR_OK;
+}
+
+// ABI v10 incremental chat parsing entry point. Parses the ENTIRE accumulated
+// generated text against the Chat Format Handle from chat_begin; the caller
+// diffs successive parsed states into streaming deltas.
+int32_t tr_stage_executor_chat_parse(
+        void * handle,
+        const uint8_t * state_json_ptr,
+        size_t state_json_len,
+        const uint8_t * text_ptr,
+        size_t text_len,
+        uint32_t is_partial,
+        uint8_t * out_ptr,
+        size_t out_cap,
+        size_t * out_len) {
+    auto * state = as_state(handle);
+    if (state == nullptr || out_len == nullptr) {
+        return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
+    }
+    *out_len = 0;
+    if (state_json_ptr == nullptr || state_json_len == 0) {
+        return set_error(state, "chat_parse requires the chat format state from chat_begin", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    std::string out_payload;
+    try {
+        const json format_state = json::parse(bytes_to_string(state_json_ptr, state_json_len));
+        const int format_int = format_state.value("chat_format", -1);
+        if (format_state.value("handle_version", 0) != 1 ||
+            format_int < 0 || format_int >= COMMON_CHAT_FORMAT_COUNT) {
+            return set_error(state, "chat_parse received an invalid chat format state", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        }
+
+        common_chat_parser_params parser_params;
+        parser_params.format               = static_cast<common_chat_format>(format_int);
+        parser_params.reasoning_format     = common_reasoning_format_from_name(format_state.value("reasoning_format", "none"));
+        parser_params.reasoning_in_content = false;
+        parser_params.generation_prompt    = format_state.value("generation_prompt", std::string());
+        parser_params.parse_tool_calls     = true;
+        const std::string parser_src = format_state.value("chat_parser", std::string());
+        if (!parser_src.empty()) {
+            parser_params.parser.load(parser_src);
+        }
+
+        const std::string text = bytes_to_string(text_ptr, text_len);
+        const common_chat_msg msg = common_chat_parse(text, is_partial != 0, parser_params);
+
+        json calls = json::array();
+        for (const auto & call : msg.tool_calls) {
+            calls.push_back(json{
+                { "id", call.id },
+                { "name", call.name },
+                { "arguments", call.arguments },
+            });
+        }
+        const json out_json = {
+            { "content", msg.content },
+            { "reasoning_content", msg.reasoning_content },
+            { "tool_calls", calls },
+        };
+        out_payload = out_json.dump();
+    } catch (const std::exception & e) {
+        return set_error(
+            state,
+            std::string("chat parse failed: ") + e.what(),
+            TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+
+    *out_len = out_payload.size();
+    if (out_ptr == nullptr || out_cap == 0) {
+        // probe call: report the required capacity only
+        state->last_error.clear();
+        return TENSORRELAY_STAGE_EXECUTOR_OK;
+    }
+    if (out_cap < out_payload.size()) {
+        return set_error(state, "chat parse output buffer is too small", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    std::memcpy(out_ptr, out_payload.data(), out_payload.size());
     state->last_error.clear();
     return TENSORRELAY_STAGE_EXECUTOR_OK;
 }
