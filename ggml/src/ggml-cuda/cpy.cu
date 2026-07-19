@@ -5,6 +5,57 @@
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
 
+#include "ggml-backend.h"
+#include <cstdio>
+#include <cstring>
+
+// TR-DIAG (TensorRelay): a CUDA-side copy crashed with SEGV in cuMemcpyDtoDAsync
+// during CUDA-head + Vulkan-iGPU layer-spill (GGML_OP_SET from the delta-net
+// chunk loop). This logs the tensor/buffer identities whenever a tensor whose
+// effective buffer is NOT a CUDA buffer reaches a CUDA copy — the smoking gun
+// for a cross-backend scheduling bug. Crash-safe: append + flush per line.
+// Runtime child stderr is nulled by the supervisor, so log to a file.
+static void tr_diag_tensor(FILE * f, const char * tag, const ggml_tensor * t) {
+    ggml_backend_buffer_t buf  = t->buffer;
+    ggml_backend_buffer_t vbuf = t->view_src ? t->view_src->buffer : nullptr;
+    fprintf(f, "  %s: name=%s op=%s type=%s data=%p buf=%s view_src=%s view_buf=%s\n",
+        tag, t->name, ggml_op_name(t->op), ggml_type_name(t->type), t->data,
+        buf ? ggml_backend_buffer_name(buf) : "(null)",
+        t->view_src ? t->view_src->name : "(none)",
+        vbuf ? ggml_backend_buffer_name(vbuf) : "(null)");
+}
+
+static bool tr_diag_buf_not_cuda(const ggml_tensor * t) {
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    if (buf == nullptr) {
+        return t->data == nullptr; // truly unallocated is suspicious too
+    }
+    const char * name = ggml_backend_buffer_name(buf);
+    return name == nullptr || strncmp(name, "CUDA", 4) != 0;
+}
+
+static void tr_diag_check_cpy(const char * where, const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (!tr_diag_buf_not_cuda(src0) && !tr_diag_buf_not_cuda(src1)) {
+        return;
+    }
+    FILE * f = fopen("/tmp/tr-cuda-diag.log", "a");
+    if (f != nullptr) {
+        fprintf(f, "[TR-DIAG] %s: non-CUDA buffer in CUDA copy!\n", where);
+        tr_diag_tensor(f, "src", src0);
+        tr_diag_tensor(f, "dst", src1);
+        fflush(f);
+        fclose(f);
+    }
+    // Abort with a diagnosable message instead of letting the CUDA driver
+    // segfault on a foreign (e.g. Vulkan) buffer. The sched pass 4.5 in
+    // ggml-backend.cpp should make this unreachable; if it fires, a new
+    // cross-backend shape slipped through — see /tmp/tr-cuda-diag.log.
+    GGML_ABORT("%s: tensor in CUDA copy lives in a non-CUDA buffer (src buf=%s, dst buf=%s) — cross-backend scheduling bug",
+        where,
+        src0->buffer ? ggml_backend_buffer_name(src0->buffer) : (src0->view_src && src0->view_src->buffer ? ggml_backend_buffer_name(src0->view_src->buffer) : "null"),
+        src1->buffer ? ggml_backend_buffer_name(src1->buffer) : (src1->view_src && src1->view_src->buffer ? ggml_backend_buffer_name(src1->view_src->buffer) : "null"));
+}
+
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
@@ -387,6 +438,7 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
+    tr_diag_check_cpy("ggml_cuda_cpy", src0, src1);
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 

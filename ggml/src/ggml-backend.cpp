@@ -1242,6 +1242,47 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // TENSORRELAY pass 4.5: in-place ops must run on the backend that owns their
+    // memory. A non-view node with a view_src writes THROUGH the view into its
+    // view_src's allocation (e.g. GGML_OP_SET from ggml_set_inplace in the
+    // delta-net chunk loop). When mixed backends split a layer (CUDA head +
+    // Vulkan/CPU layer-spill, ADR-0018), the expansion passes can assign such a
+    // node to a backend that cannot address the view_src's buffer at all —
+    // observed live: a SET scheduled on CUDA writing into a Vulkan1-allocated
+    // tensor, crashing in cuMemcpyDtoDAsync (SEGV, no recoverable error). Input
+    // COPIES do not help: the write target is shared memory via view_src, which
+    // pass 5 never duplicates. Reassign the node to the backend that owns the
+    // root of its view chain whenever that backend supports the op; srcs on
+    // other backends are handled by the normal pass-5 input copies. Single-
+    // backend graphs are unaffected (ids always match).
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->view_src == NULL || ggml_is_view_op(node->op)) {
+            continue;
+        }
+        struct ggml_tensor * root = node->view_src;
+        while (root->view_src != NULL) {
+            root = root->view_src;
+        }
+        int root_backend_id = tensor_backend_id(root);
+        int * node_backend_id = &tensor_backend_id(node);
+        if (root_backend_id == -1 || *node_backend_id == root_backend_id) {
+            continue;
+        }
+        if (ggml_backend_supports_op(sched->backends[root_backend_id], node)) {
+            *node_backend_id = root_backend_id;
+            SET_CAUSE(node, "4.5.inplace");
+        } else {
+            // The memory owner cannot run this op: the node would write into a
+            // foreign buffer. Surface it loudly — this is the exact shape that
+            // otherwise dies as an undebuggable native crash mid-decode.
+            GGML_LOG_WARN("%s: in-place op %s (%s) on backend %s writes into %s owned by %s which cannot run it\n",
+                __func__, node->name, ggml_op_name(node->op),
+                ggml_backend_name(sched->backends[*node_backend_id]), root->name,
+                ggml_backend_name(sched->backends[root_backend_id]));
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
