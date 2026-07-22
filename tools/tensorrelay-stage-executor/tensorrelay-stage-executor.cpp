@@ -7,6 +7,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -98,33 +99,40 @@ struct tr_stage_executor_state {
 
 static std::once_flag backend_init_once;
 
-// ABI v11 backend diagnostics. ggml logs backend init failures (e.g.
-// ggml_cuda_init: "failed to initialize CUDA: <reason>") through its log
+// ABI v11 backend diagnostics. ggml explains an absent backend through its log
 // callback, which defaults to stderr and is lost on a GUI app with no console.
-// Capture WARN/ERROR lines into a bounded buffer the host can read after a
-// device probe, so a physically present GPU the executor could not load can
-// report ggml's real reason instead of a guess. Everything still goes to
-// stderr to preserve the default behavior.
+// The useful lines are INFO, not just ERROR: with GGML_BACKEND_DL, a CUDA card
+// the runtime cannot use surfaces as "backend ...ggml-cuda... is not supported
+// on this system" and "found 0 CUDA devices" (both INFO), while a hard init
+// failure is ERROR. Capture INFO and above into a bounded buffer the host can
+// read after a device probe, so a present-but-unloadable GPU reports ggml's
+// real reason instead of a guess.
+//
+// Capture is armed only around backend load and device enumeration
+// (`diag_capturing`), so a later model load's INFO flood never buries it. All
+// lines still go to stderr, so default behavior is unchanged.
 static std::mutex diag_mutex;
 static std::string diag_buffer;
 static enum ggml_log_level diag_last_level = GGML_LOG_LEVEL_INFO;
-static constexpr size_t DIAG_BUFFER_CAP = 8192;
+static std::atomic<bool> diag_capturing{false};
+static constexpr size_t DIAG_BUFFER_CAP = 16384;
 
 static void tr_stage_executor_log_capture(enum ggml_log_level level, const char * text, void * /*user_data*/) {
     if (text == nullptr) {
         return;
     }
     fputs(text, stderr);
+    if (!diag_capturing.load(std::memory_order_relaxed)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(diag_mutex);
     // CONT continues the previous line at its level (ggml splits multi-line
-    // messages), so a follow-on to an error is still kept.
+    // messages), so a follow-on to a captured line is kept at that level.
     const enum ggml_log_level effective = level == GGML_LOG_LEVEL_CONT ? diag_last_level : level;
     if (level != GGML_LOG_LEVEL_CONT) {
         diag_last_level = level;
     }
-    if (effective < GGML_LOG_LEVEL_WARN || diag_buffer.size() >= DIAG_BUFFER_CAP) {
-        // Keep the earliest warnings/errors: CUDA init fails once at startup,
-        // so preserve it rather than evict it under later chatter.
+    if (effective < GGML_LOG_LEVEL_INFO || diag_buffer.size() >= DIAG_BUFFER_CAP) {
         return;
     }
     diag_buffer.append(text, std::min(std::strlen(text), DIAG_BUFFER_CAP - diag_buffer.size()));
@@ -136,6 +144,14 @@ static void install_log_capture() {
         ggml_log_set(tr_stage_executor_log_capture, nullptr);
     });
 }
+
+// Arms diagnostic capture for its scope. Nested arms stay armed until the
+// outermost guard exits (a load path may enumerate within its own window).
+struct diag_capture_scope {
+    bool previous;
+    diag_capture_scope() : previous(diag_capturing.exchange(true, std::memory_order_relaxed)) {}
+    ~diag_capture_scope() { diag_capturing.store(previous, std::memory_order_relaxed); }
+};
 
 static tr_stage_executor_state * as_state(void * handle) {
     return static_cast<tr_stage_executor_state *>(handle);
@@ -1334,11 +1350,16 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         params->split_count == 1 ||
         (is_split_graph_execution_architecture(metadata.architecture) && state->split_unsound_reason.empty());
     if (load_llama_runtime) {
-        std::call_once(backend_init_once, []() {
-            install_log_capture();
-            llama_backend_init();
-            ggml_backend_load_all();
-        });
+        {
+            // Arm only around the one-time backend load, not the model load
+            // that follows (its INFO would bury the backend diagnostics).
+            diag_capture_scope diag_scope;
+            std::call_once(backend_init_once, []() {
+                install_log_capture();
+                llama_backend_init();
+                ggml_backend_load_all();
+            });
+        }
         std::vector<ggml_backend_dev_t> devices;
         std::string device_error;
         if (!resolve_selected_devices(state->selected_devices, devices, state->device_names, device_error)) {
@@ -1970,6 +1991,10 @@ int32_t tr_stage_executor_enumerate_devices(
     }
     *out_len = 0;
     std::lock_guard<std::mutex> lock(state->mutex);
+    // Capture ggml's backend-load + device diagnostics across the whole probe:
+    // whether a backend's support check runs during load_all or lazily on the
+    // first ggml_backend_dev_count, it lands in the buffer.
+    diag_capture_scope diag_scope;
     std::call_once(backend_init_once, []() {
         install_log_capture();
         llama_backend_init();
