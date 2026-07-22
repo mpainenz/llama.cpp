@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -96,6 +97,45 @@ struct tr_stage_executor_state {
 };
 
 static std::once_flag backend_init_once;
+
+// ABI v11 backend diagnostics. ggml logs backend init failures (e.g.
+// ggml_cuda_init: "failed to initialize CUDA: <reason>") through its log
+// callback, which defaults to stderr and is lost on a GUI app with no console.
+// Capture WARN/ERROR lines into a bounded buffer the host can read after a
+// device probe, so a physically present GPU the executor could not load can
+// report ggml's real reason instead of a guess. Everything still goes to
+// stderr to preserve the default behavior.
+static std::mutex diag_mutex;
+static std::string diag_buffer;
+static enum ggml_log_level diag_last_level = GGML_LOG_LEVEL_INFO;
+static constexpr size_t DIAG_BUFFER_CAP = 8192;
+
+static void tr_stage_executor_log_capture(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (text == nullptr) {
+        return;
+    }
+    fputs(text, stderr);
+    std::lock_guard<std::mutex> lock(diag_mutex);
+    // CONT continues the previous line at its level (ggml splits multi-line
+    // messages), so a follow-on to an error is still kept.
+    const enum ggml_log_level effective = level == GGML_LOG_LEVEL_CONT ? diag_last_level : level;
+    if (level != GGML_LOG_LEVEL_CONT) {
+        diag_last_level = level;
+    }
+    if (effective < GGML_LOG_LEVEL_WARN || diag_buffer.size() >= DIAG_BUFFER_CAP) {
+        // Keep the earliest warnings/errors: CUDA init fails once at startup,
+        // so preserve it rather than evict it under later chatter.
+        return;
+    }
+    diag_buffer.append(text, std::min(std::strlen(text), DIAG_BUFFER_CAP - diag_buffer.size()));
+}
+
+static void install_log_capture() {
+    static std::once_flag log_capture_once;
+    std::call_once(log_capture_once, []() {
+        ggml_log_set(tr_stage_executor_log_capture, nullptr);
+    });
+}
 
 static tr_stage_executor_state * as_state(void * handle) {
     return static_cast<tr_stage_executor_state *>(handle);
@@ -1295,6 +1335,7 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         (is_split_graph_execution_architecture(metadata.architecture) && state->split_unsound_reason.empty());
     if (load_llama_runtime) {
         std::call_once(backend_init_once, []() {
+            install_log_capture();
             llama_backend_init();
             ggml_backend_load_all();
         });
@@ -1930,6 +1971,7 @@ int32_t tr_stage_executor_enumerate_devices(
     *out_len = 0;
     std::lock_guard<std::mutex> lock(state->mutex);
     std::call_once(backend_init_once, []() {
+        install_log_capture();
         llama_backend_init();
         ggml_backend_load_all();
     });
@@ -2015,6 +2057,16 @@ size_t tr_stage_executor_last_error(void * handle, uint8_t * out_ptr, size_t out
     }
     const size_t n = std::min(out_len, message.size());
     std::memcpy(out_ptr, message.data(), n);
+    return n;
+}
+
+size_t tr_stage_executor_read_diagnostics(uint8_t * out_ptr, size_t out_len) {
+    std::lock_guard<std::mutex> lock(diag_mutex);
+    if (out_ptr == nullptr || out_len == 0) {
+        return diag_buffer.size();
+    }
+    const size_t n = std::min(out_len, diag_buffer.size());
+    std::memcpy(out_ptr, diag_buffer.data(), n);
     return n;
 }
 

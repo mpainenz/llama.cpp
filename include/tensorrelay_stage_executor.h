@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 10u
+#define TENSORRELAY_STAGE_EXECUTOR_ABI_VERSION 11u
 #define TENSORRELAY_STAGE_EXECUTOR_OK 0
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT -1
 #define TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED -2
@@ -241,6 +241,13 @@ TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_enumerate_devices(
     size_t out_cap,
     size_t * out_len);
 TENSORRELAY_STAGE_EXECUTOR_API size_t   tr_stage_executor_last_error(void * handle, uint8_t * out_ptr, size_t out_len);
+
+// ABI v11: process-wide ggml backend diagnostics captured since load - the
+// WARN/ERROR lines ggml would otherwise write only to stderr, including the
+// reason a backend (e.g. CUDA) failed to initialize. Handle-free: the log is
+// global. Non-clearing, so a one-time init failure survives repeated reads.
+// Two-call pattern: out_ptr NULL or out_len 0 returns the required byte count.
+TENSORRELAY_STAGE_EXECUTOR_API size_t   tr_stage_executor_read_diagnostics(uint8_t * out_ptr, size_t out_len);
 
 #ifdef __cplusplus
 }
