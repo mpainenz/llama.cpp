@@ -149,11 +149,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item build\bin\Release\tensorrelay_stage_executor.dll dist\
           Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination dist\
-          # Bundle CUDA runtime DLLs (not in build output, installed system-wide by toolkit)
-          $cudaBin = Join-Path $env:CUDA_PATH "bin"
-          Copy-Item "$cudaBin\cublas64_*.dll" dist\ -ErrorAction SilentlyContinue
-          Copy-Item "$cudaBin\cublasLt64_*.dll" dist\ -ErrorAction SilentlyContinue
-          Copy-Item "$cudaBin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
+          # Bundle CUDA runtime DLLs (not in build output, installed by toolkit).
+          # CUDA 13 moved these out of bin\ into bin\x64\, so search the whole
+          # toolkit rather than assuming bin\. ggml-cuda.dll imports cublas64_13,
+          # which imports cudart64_13 + cublasLt64_13; without them LoadLibrary
+          # fails with error 126, and a release ggml swallows that silently
+          # (bool silent = true under NDEBUG in ggml_backend_load_all_from_path).
+          # So VERIFY they landed, exactly as the VC redist below does -- a
+          # missing one ships a CUDA bundle that can never load on any machine.
+          foreach ($pat in @("cudart64_*.dll","cublas64_*.dll","cublasLt64_*.dll")) {
+            Get-ChildItem -Path $env:CUDA_PATH -Recurse -Filter $pat -ErrorAction SilentlyContinue |
+              Select-Object -First 1 | Copy-Item -Destination dist\ -ErrorAction SilentlyContinue
+          }
+          foreach ($req in @("cudart64_13.dll","cublas64_13.dll","cublasLt64_13.dll")) {
+            if (-not (Test-Path (Join-Path dist $req))) {
+              Write-Error "CUDA runtime DLL $req not bundled (searched $env:CUDA_PATH); ggml-cuda.dll would fail to load with error 126"
+            }
+          }
           # Bundle the MSVC CRT redistributables: consumer machines without the
           # VC redist otherwise fail LoadLibrary with error 126 on a transitive
           # dependency (the same failure class as the MinGW libgomp incident).
