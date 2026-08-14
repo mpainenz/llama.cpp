@@ -32,7 +32,6 @@ env:
     -DGGML_RPC=OFF
     -DGGML_BACKEND_DL=ON
     -DGGML_NATIVE=OFF
-    -DGGML_BACKEND_DL=ON
 
 jobs:
   linux-vulkan-x64:
@@ -97,17 +96,17 @@ jobs:
           retention-days: 30
 
   windows-cuda-x64:
-    name: Windows CUDA 13.1 + Vulkan x64
+    name: Windows CUDA 13.3 + Vulkan x64
     runs-on: windows-2022
     env:
-      VULKAN_VERSION: 1.4.313.2
+      VULKAN_VERSION: 1.4.357.0
     steps:
       - uses: actions/checkout@v4
 
       - name: Install CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '13.1'
+          cuda_version: '13.3'
 
       - name: Install Vulkan SDK
         run: |
@@ -129,7 +128,9 @@ jobs:
           # re-packs a build dir configured with the old flags.
           # v6: GGML_BACKEND_DL=ON entered CMAKE_COMMON (upstream merge 2026-08-14
           # made it mandatory for GGML_CPU_ALL_VARIANTS; backends now ship as DLLs).
-          key: win-cuda13.1-vulkan-v6-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
+          # v7: CUDA 13.1 -> 13.3, Vulkan SDK 1.4.313.2 -> 1.4.357.0,
+          # GGML_NATIVE=OFF entered CMAKE_COMMON (2026-08-15 pin sweep).
+          key: win-cuda13.3-vulkan-v7-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
 
       - name: Build stage executor
         if: steps.cache-win-build.outputs.cache-hit != 'true'
@@ -182,13 +183,13 @@ jobs:
           Copy-Item LICENSE dist\
           Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
           if (-not (Test-Path dist\tensorrelay_stage_executor.dll)) { Write-Error "stage executor dll missing" }
-          Compress-Archive -Path dist\* -DestinationPath tensorrelay-stage-executor-win-cuda-13.1-x64.zip
+          Compress-Archive -Path dist\* -DestinationPath tensorrelay-stage-executor-win-cuda-13.3-x64.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tensorrelay-stage-executor-win-cuda-13.1-x64
-          path: tensorrelay-stage-executor-win-cuda-13.1-x64.zip
+          name: tensorrelay-stage-executor-win-cuda-13.3-x64
+          path: tensorrelay-stage-executor-win-cuda-13.3-x64.zip
           retention-days: 30
 
   release:
@@ -218,4 +219,4 @@ jobs:
           prerelease: true
           files: |
             artifacts/tensorrelay-stage-executor-linux-vulkan-x64/tensorrelay-stage-executor-linux-vulkan-x64.tar.gz
-            artifacts/tensorrelay-stage-executor-win-cuda-13.1-x64/tensorrelay-stage-executor-win-cuda-13.1-x64.zip
+            artifacts/tensorrelay-stage-executor-win-cuda-13.3-x64/tensorrelay-stage-executor-win-cuda-13.3-x64.zip
