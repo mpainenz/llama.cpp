@@ -30,6 +30,7 @@ env:
     -DLLAMA_BUILD_SERVER=OFF
     -DLLAMA_OPENSSL=OFF
     -DGGML_RPC=OFF
+    -DGGML_BACKEND_DL=ON
     -DGGML_NATIVE=OFF
     -DGGML_BACKEND_DL=ON
 
@@ -126,7 +127,9 @@ jobs:
           # v5: LLAMA_OPENSSL=OFF entered CMAKE_COMMON; the key hashes sources
           # only, so a flag change must bump this version or a warm cache
           # re-packs a build dir configured with the old flags.
-          key: win-cuda13.1-vulkan-v5-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
+          # v6: GGML_BACKEND_DL=ON entered CMAKE_COMMON (upstream merge 2026-08-14
+          # made it mandatory for GGML_CPU_ALL_VARIANTS; backends now ship as DLLs).
+          key: win-cuda13.1-vulkan-v6-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
 
       - name: Build stage executor
         if: steps.cache-win-build.outputs.cache-hit != 'true'

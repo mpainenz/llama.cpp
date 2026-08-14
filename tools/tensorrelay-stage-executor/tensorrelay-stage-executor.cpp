@@ -20,7 +20,54 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    include <windows.h>
+#else
+#    include <dlfcn.h>
+#endif
+
 using json = nlohmann::ordered_json;
+
+// With GGML_BACKEND_DL the ggml backends ship as shared libraries next to
+// THIS library, not next to the host executable that dlopen'd it, so
+// ggml_backend_load_all()'s executable-dir search would find nothing. Resolve
+// the executor's own directory and load from there; fall back to the default
+// search if that fails.
+static void tensorrelay_load_backends() {
+#if defined(_WIN32)
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&tensorrelay_load_backends), &mod)) {
+        wchar_t buf[MAX_PATH];
+        DWORD n = GetModuleFileNameW(mod, buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            const std::wstring wdir = std::filesystem::path(buf).parent_path().wstring();
+            // ggml expects UTF-8 paths (it converts back via fs::u8path).
+            int len = WideCharToMultiByte(CP_UTF8, 0, wdir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (len > 0) {
+                std::string dir(len - 1, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wdir.c_str(), -1, dir.data(), len, nullptr, nullptr);
+                if (!dir.empty()) {
+                    ggml_backend_load_all_from_path(dir.c_str());
+                    return;
+                }
+            }
+        }
+    }
+#else
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void *>(&tensorrelay_load_backends), &info) && info.dli_fname) {
+        const std::string dir = std::filesystem::path(info.dli_fname).parent_path().string();
+        if (!dir.empty()) {
+            ggml_backend_load_all_from_path(dir.c_str());
+            return;
+        }
+    }
+#endif
+    ggml_backend_load_all();
+}
 
 struct tr_stage_metadata {
     bool        has_tensorrelay_stage_metadata = false;
@@ -1998,7 +2045,7 @@ int32_t tr_stage_executor_enumerate_devices(
     std::call_once(backend_init_once, []() {
         install_log_capture();
         llama_backend_init();
-        ggml_backend_load_all();
+        tensorrelay_load_backends();
     });
 
     json devices = json::array();
