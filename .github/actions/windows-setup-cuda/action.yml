@@ -106,7 +106,6 @@ runs:
       shell: pwsh
       run: |
           mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-          choco install unzip -y
           curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.73-archive.zip"
           curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip"
           curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.3.73-archive.zip"
@@ -117,7 +116,9 @@ runs:
           curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.3.27-archive.zip"
           curl -O "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.3.31-archive.zip"
           curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cccl/windows-x86_64/cccl-windows-x86_64-13.3.3.4.1-archive.zip"
-          unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          # Runner-native bsdtar instead of choco unzip: chocolatey's feed 503'd
+          # a build (2026-08-15) and the silent fallback extracted nothing.
+          Get-ChildItem *.zip | ForEach-Object { tar -xf $_.FullName -C "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" }
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_crt-windows-x86_64-13.3.73-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_cudart-windows-x86_64-13.3.29-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvcc-windows-x86_64-13.3.73-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
