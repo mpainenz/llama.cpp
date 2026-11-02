@@ -6,6 +6,16 @@ if (POLICY CMP0147)
     cmake_policy(SET CMP0147 NEW)
 endif()
 
+set(GGML_VULKAN_SHADER_JOBS "0" CACHE STRING "Concurrent shader compilers (0=automatic, 1-16=bounded)")
+if (NOT GGML_VULKAN_SHADER_JOBS MATCHES "^(0|[1-9][0-9]?)$" OR GGML_VULKAN_SHADER_JOBS GREATER 16)
+    message(FATAL_ERROR "GGML_VULKAN_SHADER_JOBS must be 0 through 16")
+endif()
+
+set(GGML_VULKAN_SHADER_PARTS "1" CACHE STRING "Embedded shader compilation units per source (1-64)")
+if (NOT GGML_VULKAN_SHADER_PARTS MATCHES "^[1-9][0-9]*$" OR GGML_VULKAN_SHADER_PARTS GREATER 64)
+    message(FATAL_ERROR "GGML_VULKAN_SHADER_PARTS must be 1 through 64")
+endif()
+
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 
 if (DEFINED ENV{VULKAN_SDK})
@@ -226,10 +236,19 @@ if (Vulkan_FOUND)
         get_filename_component(file ${file_full} NAME)
         set (_ggml_vk_target_cpp "${CMAKE_CURRENT_BINARY_DIR}/${file}.cpp")
 
+        set(_ggml_vk_outputs "${_ggml_vk_target_cpp}")
+        if (GGML_VULKAN_SHADER_PARTS GREATER 1)
+            math(EXPR _ggml_vk_last_part "${GGML_VULKAN_SHADER_PARTS} - 1")
+            foreach (part RANGE 1 ${_ggml_vk_last_part})
+                list(APPEND _ggml_vk_outputs "${_ggml_vk_target_cpp}.part${part}.cpp")
+            endforeach()
+        endif()
         add_custom_command(
-            OUTPUT  ${_ggml_vk_target_cpp}
+            OUTPUT  ${_ggml_vk_outputs}
             DEPFILE ${_ggml_vk_target_cpp}.d
             COMMAND ${_ggml_vk_genshaders_cmd}
+                --jobs       ${GGML_VULKAN_SHADER_JOBS}
+                --parts      ${GGML_VULKAN_SHADER_PARTS}
                 --glslc      ${Vulkan_GLSLC_EXECUTABLE}
                 --source     ${file_full}
                 --output-dir ${_ggml_vk_output_dir}
@@ -240,7 +259,7 @@ if (Vulkan_FOUND)
                     vulkan-shaders-gen
             COMMENT "Generate vulkan shaders for ${file}"
         )
-        target_sources(ggml-vulkan PRIVATE ${_ggml_vk_target_cpp})
+        target_sources(ggml-vulkan PRIVATE ${_ggml_vk_outputs})
     endforeach()
 
 else()
