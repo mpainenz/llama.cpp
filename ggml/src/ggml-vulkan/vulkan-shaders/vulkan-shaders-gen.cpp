@@ -45,6 +45,8 @@ std::string input_filepath = "";
 std::string output_dir = "/tmp";
 std::string target_hpp = "";
 std::string target_cpp = "";
+uint32_t shader_parts = 1; // split embedded bytes without changing shader payloads
+uint32_t shader_jobs = 0; // zero preserves automatic concurrency
 
 const std::vector<std::string> type_names = {
     "f32",
@@ -328,7 +330,7 @@ using compile_count_guard = std::unique_ptr<uint32_t, decltype(&decrement_compil
 compile_count_guard acquire_compile_slot() {
     // wait until fewer than N compiles are in progress.
     // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
-    uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    uint32_t N = shader_jobs ? shader_jobs : std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::unique_lock<std::mutex> guard(compile_count_mutex);
     compile_count_cond.wait(guard, [N] { return compile_count < N; });
     compile_count++;
@@ -1152,6 +1154,12 @@ void process_shaders() {
 void write_output_files() {
     std::stringstream hdr = make_generic_stringstream();
     std::stringstream src = make_generic_stringstream();
+    std::vector<std::stringstream> parts(shader_parts);
+    std::vector<size_t> part_bytes(shader_parts, 0);
+    for (auto & part : parts) {
+        part.imbue(c_locale);
+        part << "#include \"" << basename(target_hpp) << "\"\n\n";
+    }
 
     hdr << "#include <cstdint>\n\n";
     src << "#include \"" << basename(target_hpp) << "\"\n\n";
@@ -1175,14 +1183,17 @@ void write_output_files() {
                 continue;
             }
 
-            src << "const uint64_t " << name << "_len = " << data.size() << ";\n";
-            src << "const unsigned char " << name << "_data[" << data.size() << "] = {\n" << std::hex;
+            const size_t index = std::min_element(part_bytes.begin(), part_bytes.end()) - part_bytes.begin();
+            auto & part = parts[index];
+            part_bytes[index] += data.size();
+            part << "const uint64_t " << name << "_len = " << data.size() << ";\n";
+            part << "const unsigned char " << name << "_data[" << data.size() << "] = {\n" << std::hex;
             auto bytes = reinterpret_cast<const uint8_t*>(data.data());
             for (size_t i = 0; i < data.size(); ++i) {
-                src << "0x" << static_cast<int>(bytes[i]) << ",";
-                if ((i + 1) % 12 == 0) src << "\n";
+                part << "0x" << static_cast<int>(bytes[i]) << ",";
+                if ((i + 1) % 12 == 0) part << "\n";
             }
-            src << std::dec << "\n};\n\n";
+            part << std::dec << "\n};\n\n";
         }
     }
 
@@ -1292,7 +1303,10 @@ void write_output_files() {
         write_file_if_changed(target_hpp, hdr.str());
     }
     if (target_cpp != "") {
-        write_binary_file(target_cpp, src.str());
+        write_binary_file(target_cpp, src.str() + parts[0].str());
+        for (size_t i = 1; i < parts.size(); ++i) {
+            write_binary_file(target_cpp + ".part" + std::to_string(i) + ".cpp", parts[i].str());
+        }
     }
 }
 
@@ -1310,6 +1324,23 @@ int main(int argc, char** argv) {
                 args[arg] = "";
             }
         }
+    }
+
+    if (args.find("--parts") != args.end()) {
+        const auto & value = args["--parts"];
+        if (value.empty() || value.size() > 2 || value.find_first_not_of("0123456789") != std::string::npos || std::stoul(value) < 1 || std::stoul(value) > 64) {
+            std::cerr << "--parts must be an integer from 1 to 64\n";
+            return EXIT_FAILURE;
+        }
+        shader_parts = static_cast<uint32_t>(std::stoul(value));
+    }
+    if (args.find("--jobs") != args.end()) {
+        const auto & value = args["--jobs"];
+        if (value.empty() || value.size() > 2 || value.find_first_not_of("0123456789") != std::string::npos || std::stoul(value) > 16) {
+            std::cerr << "--jobs must be an integer from 0 (automatic) to 16\n";
+            return EXIT_FAILURE;
+        }
+        shader_jobs = static_cast<uint32_t>(std::stoul(value));
     }
 
     if (args.find("--glslc") != args.end()) {
