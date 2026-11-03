@@ -12,6 +12,11 @@ on:
   push:
     branches: [tensorrelay]
   workflow_dispatch:
+    inputs:
+      local_linux_trial:
+        description: Validate only the local Linux build without publishing
+        type: boolean
+        default: false
 
 concurrency:
   group: tensorrelay-${{ github.ref }}
@@ -36,16 +41,26 @@ env:
 jobs:
   linux-vulkan-x64:
     name: Linux Vulkan x64
-    runs-on: ubuntu-22.04
+    runs-on: ${{ (inputs.local_linux_trial || vars.LLAMA_LOCAL_CI == 'true') && 'llama-linux' || 'ubuntu-22.04' }}
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Vulkan SDK
+      - name: Install hosted Vulkan SDK
+        if: ${{ !inputs.local_linux_trial && vars.LLAMA_LOCAL_CI != 'true' }}
         run: |
           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update -y
           sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk
+
+      - name: Verify prepared toolchain
+        run: |
+          test "$(id -u)" != 0
+          cmake --version
+          glslc --version
+          c++ --version
+          python3 tests/test-vulkan-memory.py
 
       - name: Build stage executor
         run: |
@@ -55,9 +70,16 @@ jobs:
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_VULKAN=ON \
+            -DGGML_VULKAN_SHADER_JOBS=1 \
+            -DGGML_VULKAN_SHADER_PARTS=16 \
             -DGGML_CPU_ALL_VARIANTS=ON \
             ${{ env.CMAKE_COMMON }}
-          cmake --build build --config Release --target tensorrelay_stage_executor -j $(nproc)
+          cmake --build build --config Release --target tensorrelay_stage_executor -j 1
+
+      - name: Record memory result
+        if: always()
+        run: |
+          cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events
 
       - name: Pack artifacts
         run: |
@@ -93,10 +115,11 @@ jobs:
         with:
           name: tensorrelay-stage-executor-linux-vulkan-x64
           path: tensorrelay-stage-executor-linux-vulkan-x64.tar.gz
-          retention-days: 30
+          retention-days: 3
 
   windows-cuda-x64:
     name: Windows CUDA 13.3 + Vulkan x64
+    if: ${{ !inputs.local_linux_trial }}
     runs-on: windows-2022
     env:
       VULKAN_VERSION: 1.4.357.0
@@ -190,11 +213,12 @@ jobs:
         with:
           name: tensorrelay-stage-executor-win-cuda-13.3-x64
           path: tensorrelay-stage-executor-win-cuda-13.3-x64.zip
-          retention-days: 30
+          retention-days: 3
 
   release:
     name: Create Release
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LLAMA_LOCAL_CI == 'true' && 'llama-linux' || 'ubuntu-latest' }}
+    timeout-minutes: 30
     needs: [linux-vulkan-x64, windows-cuda-x64]
     if: github.event_name == 'push'
     permissions:
