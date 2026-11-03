@@ -1,0 +1,28 @@
+# Dependabot configuration for mpainenz/llama.cpp.
+# Place this file on the default branch (master). Never change the default branch.
+# Pull requests target tensorrelay.
+# Enabled ecosystem: GitHub Actions. The maintained workflow on tensorrelay is
+# .github/workflows/build-tensorrelay.yml (actions/checkout, upload-artifact,
+# download-artifact, cache, and softprops/action-gh-release).
+# Example Dockerfiles, Nix, and vendored trees are not enabled. Upstream sync owns them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: tensorrelay
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Pacific/Auckland
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
