@@ -61,6 +61,7 @@ jobs:
           glslc --version
           c++ --version
           python3 tests/test-vulkan-memory.py
+          python3 tests/test-linux-runtime.py
 
       - name: Build stage executor
         run: |
@@ -96,6 +97,7 @@ jobs:
             esac
           done
           shopt -u nullglob
+          python3 tests/check-linux-runtime.py dist
           cp LICENSE dist/
           echo "Packed libraries:"
           ls -lh dist/*.so* || true
