@@ -1,0 +1,241 @@
+name: Linux Vulkan harness
+# Repo-owned smoke for mpainenz/llama.cpp branch tensorrelay.
+# workflow_dispatch is already admitted for this repository on
+# refs/heads/tensorrelay (admission commit
+# 8f24d0226a232d3cbf8b74e1d2125c9fe4921d3b). This file uses that
+# event and push. It does not change admission.
+# verify_manifest.py writes harness_manifest_verified and
+# harness_source_sha only after MANIFEST.sha256 matches. That pair of
+# fields proves the vendored harness bytes. It does not record the
+# consumer checkout, and it does not claim the fork SHA was tested.
+# One job, -j 1, shader jobs 1, timeout 230. No package install
+# and no build-cache action. build-tensorrelay.yml is unchanged.
+'on':
+  push:
+    branches:
+      - tensorrelay
+  workflow_dispatch:
+    inputs:
+      fork_sha:
+        description: Candidate llama.cpp SHA to compile. Empty uses github.sha.
+        required: false
+        default: ""
+        type: string
+      harness_source_sha:
+        description: Expected SHA of these vendored harness bytes. Empty uses BOUND_REVISION. This does not record a consumer checkout.
+        required: false
+        default: ""
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: linux-vulkan-harness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  linux-vulkan:
+    name: Linux Vulkan compile and smoke
+    runs-on: llama-linux
+    timeout-minutes: 230
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify the vendored harness bytes
+        id: verify
+        env:
+          INPUT_FORK_SHA: ${{ github.event.inputs.fork_sha }}
+          INPUT_HARNESS_SOURCE_SHA: ${{ github.event.inputs.harness_source_sha }}
+        run: |
+          set -euo pipefail
+          fork_sha="${INPUT_FORK_SHA:-}"
+          harness_source_sha="${INPUT_HARNESS_SOURCE_SHA:-}"
+          if [ -z "$fork_sha" ]; then
+            fork_sha="$GITHUB_SHA"
+          fi
+          if [ -z "$harness_source_sha" ]; then
+            harness_source_sha=$(tr -d '[:space:]' < ci/tensorrelay-harness/BOUND_REVISION)
+          fi
+          printf '%s\n' "$fork_sha" | grep -Eq '^[0-9a-f]{40}$'
+          python3 ci/tensorrelay-harness/verify_manifest.py \
+            --root "$GITHUB_WORKSPACE" \
+            --manifest ci/tensorrelay-harness/MANIFEST.sha256 \
+            --bound ci/tensorrelay-harness/BOUND_REVISION \
+            --harness-source-sha "$harness_source_sha"
+          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
+          echo "harness_source_sha=$harness_source_sha" >> "$GITHUB_OUTPUT"
+          echo "artifact=llama-fork-harness-evidence-${fork_sha}-${harness_source_sha}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Harness manifest"
+            echo ""
+            echo "- harness_manifest_verified: true"
+            echo "- harness_source_sha: \`$harness_source_sha\`"
+            echo "- proves: vendored harness bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify prepared toolchain
+        run: |
+          set -euo pipefail
+          test "$(id -u)" != 0
+          cmake --version
+          c++ --version
+          glslc --version
+          python3 --version
+
+      - name: Check out the candidate fork SHA
+        env:
+          FORK_SHA: ${{ steps.verify.outputs.fork_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$FORK_SHA" = "$(git rev-parse HEAD)" ]; then
+            echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/source-dir"
+          else
+            git fetch --depth=1 origin "$FORK_SHA"
+            git worktree add --detach "$RUNNER_TEMP/llama-src" "$FORK_SHA"
+            echo "$RUNNER_TEMP/llama-src" > "$RUNNER_TEMP/source-dir"
+          fi
+          {
+            echo "## Candidate fork"
+            echo ""
+            echo "- fork_sha: \`$FORK_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure stage executor
+        id: configure
+        run: |
+          set -euo pipefail
+          src=$(cat "$RUNNER_TEMP/source-dir")
+          rm -rf "$RUNNER_TEMP/build"
+          cmake -S "$src" -B "$RUNNER_TEMP/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_VULKAN=ON \
+            -DGGML_VULKAN_SHADER_JOBS=1 \
+            -DGGML_VULKAN_SHADER_PARTS=16 \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DGGML_RPC=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            2>&1 | tee "$RUNNER_TEMP/cmake-configure.log"
+
+      - name: Build stage executor
+        id: build
+        run: |
+          set -euo pipefail
+          cmake --build "$RUNNER_TEMP/build" --config Release --target tensorrelay_stage_executor -j 1 \
+            2>&1 | tee "$RUNNER_TEMP/cmake-build.log"
+
+      - name: Check exported ABI symbols
+        id: exports
+        run: |
+          set -euo pipefail
+          lib="$RUNNER_TEMP/build/bin/libtensorrelay_stage_executor.so"
+          test -f "$lib"
+          nm -D "$lib" | tee "$RUNNER_TEMP/executor-exports.txt"
+          python3 ci/tensorrelay-harness/check_stage_executor_abi.py "$RUNNER_TEMP/executor-exports.txt"
+
+      - name: Record raw ELF measurements
+        id: readelf
+        run: |
+          set -euo pipefail
+          lib="$RUNNER_TEMP/build/bin/libtensorrelay_stage_executor.so"
+          test -f "$lib"
+          command -v readelf
+          readelf -W --dyn-syms "$lib" > "$RUNNER_TEMP/readelf-dyn-syms.txt"
+          readelf -W -d "$lib" > "$RUNNER_TEMP/readelf-needed.txt"
+          readelf -W --version-info "$lib" > "$RUNNER_TEMP/readelf-version-info.txt"
+          test -s "$RUNNER_TEMP/readelf-dyn-syms.txt"
+          test -s "$RUNNER_TEMP/readelf-needed.txt"
+          test -s "$RUNNER_TEMP/readelf-version-info.txt"
+
+      - name: Record vulkaninfo
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          if command -v vulkaninfo >/dev/null 2>&1; then
+            vulkaninfo --summary > "$RUNNER_TEMP/evidence/vulkaninfo.txt" || true
+          else
+            echo "vulkaninfo absent" > "$RUNNER_TEMP/evidence/vulkaninfo.txt"
+          fi
+
+      - name: Download the pinned GGUF
+        run: |
+          set -euo pipefail
+          python3 ci/tensorrelay-harness/smoke_stage_executor.py download \
+            --pin ci/tensorrelay-harness/gguf-pin.json \
+            --model "$RUNNER_TEMP/qwen2.5-0.5b-instruct-q2_k.gguf"
+
+      - name: Run the bounded smoke
+        id: smoke
+        env:
+          FORK_SHA: ${{ steps.verify.outputs.fork_sha }}
+          HARNESS_SOURCE_SHA: ${{ steps.verify.outputs.harness_source_sha }}
+          LD_LIBRARY_PATH: ${{ runner.temp }}/build/bin
+        run: |
+          set -euo pipefail
+          python3 ci/tensorrelay-harness/smoke_stage_executor.py run \
+            --pin ci/tensorrelay-harness/gguf-pin.json \
+            --settings ci/tensorrelay-harness/settings.json \
+            --model "$RUNNER_TEMP/qwen2.5-0.5b-instruct-q2_k.gguf" \
+            --library "$RUNNER_TEMP/build/bin/libtensorrelay_stage_executor.so" \
+            --fork-sha "$FORK_SHA" \
+            --harness-source-sha "$HARNESS_SOURCE_SHA" \
+            --out "$RUNNER_TEMP/evidence/observation.json"
+
+      - name: Record cgroup memory
+        if: always() && steps.verify.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          if [ -f /sys/fs/cgroup/memory.peak ]; then
+            cp /sys/fs/cgroup/memory.peak "$RUNNER_TEMP/evidence/memory.peak"
+          else
+            : > "$RUNNER_TEMP/evidence/memory.peak"
+          fi
+          if [ -f /sys/fs/cgroup/memory.events ]; then
+            cp /sys/fs/cgroup/memory.events "$RUNNER_TEMP/evidence/memory.events"
+          else
+            : > "$RUNNER_TEMP/evidence/memory.events"
+          fi
+
+      - name: Retain sanitized logs and step outcomes
+        if: always() && steps.verify.outcome == 'success'
+        env:
+          CONFIGURE_OUTCOME: ${{ steps.configure.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          EXPORT_OUTCOME: ${{ steps.exports.outcome }}
+          READELF_OUTCOME: ${{ steps.readelf.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 ci/tensorrelay-harness/retain_harness_evidence.py \
+            --dest "$RUNNER_TEMP/evidence" \
+            --configure-log "$RUNNER_TEMP/cmake-configure.log" \
+            --build-log "$RUNNER_TEMP/cmake-build.log" \
+            --export-log "$RUNNER_TEMP/executor-exports.txt" \
+            --readelf-dyn-syms "$RUNNER_TEMP/readelf-dyn-syms.txt" \
+            --readelf-needed "$RUNNER_TEMP/readelf-needed.txt" \
+            --readelf-version "$RUNNER_TEMP/readelf-version-info.txt" \
+            --configure-outcome "$CONFIGURE_OUTCOME" \
+            --build-outcome "$BUILD_OUTCOME" \
+            --export-outcome "$EXPORT_OUTCOME" \
+            --readelf-outcome "$READELF_OUTCOME" \
+            --smoke-outcome "$SMOKE_OUTCOME" \
+            --summary "$RUNNER_TEMP/evidence/outcomes.md"
+          cat "$RUNNER_TEMP/evidence/outcomes.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish retained evidence
+        if: always() && steps.verify.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.verify.outputs.artifact }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 3
+          if-no-files-found: error
