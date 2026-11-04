@@ -28,7 +28,6 @@ name: Linux Vulkan harness
         type: string
 permissions:
   contents: read
-  actions: write
 concurrency:
   group: linux-vulkan-harness-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
