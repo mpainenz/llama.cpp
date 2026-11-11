@@ -1,0 +1,12 @@
+{
+  "id": "qwen2.5-0.5b-instruct-q2_k",
+  "architecture": "qwen2",
+  "block_count": 24,
+  "reason": "Public single-stage qwen2 GGUF used by the smoke. The file is fetched from the pinned revision below.",
+  "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+  "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+  "path": "qwen2.5-0.5b-instruct-q2_k.gguf",
+  "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q2_k.gguf",
+  "sha256": "9ee36184e616dfc76df4f5dd66f908dbde6979524ae36e6cefb67f532f798cb8",
+  "size": 415182688
+}

@@ -7,6 +7,11 @@ import yaml
 
 
 class PantherRoutingTests(unittest.TestCase):
+    def test_linux_only_trial_does_not_start_windows(self):
+        workflow = Path(__file__).resolve().parents[1] / "workflows/build-tensorrelay.yml"
+        job = yaml.safe_load(workflow.read_text())["jobs"]["windows-cuda-x64"]
+        self.assertEqual(job["if"], "${{ !inputs.local_linux_trial }}")
+
     def test_only_owner_branch_builds_use_panther(self):
         workflow = Path(__file__).resolve().parents[1] / "workflows/build-tensorrelay.yml"
         job = yaml.safe_load(workflow.read_text())["jobs"]["windows-cuda-x64"]
