@@ -1902,7 +1902,23 @@ int32_t tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t
         return set_error(state, "release references an unknown slot", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
     if (state->ctx != nullptr) {
-        llama_memory_seq_rm(llama_get_memory(state->ctx), static_cast<llama_seq_id>(slot_id), -1, -1);
+        auto memory = llama_get_memory(state->ctx);
+        if (!llama_memory_seq_rm(memory, static_cast<llama_seq_id>(slot_id), -1, -1)) {
+            return set_error(state, "failed to release sequence memory", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        }
+        if (llama_model_is_recurrent(state->model) || llama_model_is_hybrid(state->model)) {
+            bool empty = true;
+            for (size_t seq = 0; seq < state->slot_epochs.size(); ++seq) {
+                if (llama_memory_seq_pos_max(memory, static_cast<llama_seq_id>(seq)) >= 0) {
+                    empty = false;
+                    break;
+                }
+            }
+            // Clear recurrent buffers only when no other sequence owns state.
+            if (empty) {
+                llama_memory_clear(memory, true);
+            }
+        }
     }
     if (slot_id < state->slot_samplers.size()) {
         reset_slot_sampler(state->slot_samplers[slot_id]);
