@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "chat.h"
+#include "chat-options.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -1741,7 +1742,7 @@ int32_t tr_stage_executor_chat_begin(
             inputs.parallel_tool_calls = true;
         }
         inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
-        inputs.enable_thinking       = true;
+        tensorrelay_apply_reasoning_effort(inputs, body);
         inputs.add_generation_prompt = true;
 
         chat_params = common_chat_templates_apply(state->chat_templates.get(), inputs);

@@ -67,6 +67,8 @@ jobs:
           c++ --version
           python3 tests/test-vulkan-memory.py
           python3 tests/test-linux-runtime.py
+          c++ -std=c++17 -Iinclude -Ivendor -Iggml/include -Icommon tests/test-tensorrelay-chat-options.cpp -o "$RUNNER_TEMP/test-tensorrelay-chat-options"
+          "$RUNNER_TEMP/test-tensorrelay-chat-options"
 
       - name: Build stage executor
         run: |
