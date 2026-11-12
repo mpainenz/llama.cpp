@@ -19,14 +19,22 @@ def violations(text):
     return sorted(set(errors))
 
 
+def missing_dependencies(text, packaged):
+    needed = re.findall(r'\(NEEDED\).*\[([^]]+)\]', text)
+    return sorted({name for name in needed if name.startswith(('libllama', 'libggml', 'libtensorrelay')) and name not in packaged})
+
+
 def main():
     libraries = sorted(pathlib.Path(sys.argv[1]).glob('*.so*'))
     if not libraries:
         raise SystemExit('No packaged libraries found; ABI check cannot pass')
     failed = False
+    packaged = {library.name for library in libraries}
     for library in libraries:
         text = subprocess.check_output(['readelf', '--version-info', str(library)], text=True)
-        for error in violations(text):
+        dynamic = subprocess.check_output(['readelf', '-d', str(library)], text=True)
+        errors = violations(text) + [f'missing packaged dependency: {name}' for name in missing_dependencies(dynamic, packaged)]
+        for error in errors:
             print(f'{library.name}: {error}', file=sys.stderr)
             failed = True
     if failed:
