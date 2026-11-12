@@ -142,6 +142,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 8
+
+      - name: Verify Panther cache selection
+        if: runner.name == 'panther-windows-llama'
+        run: python .github/scripts/test_panther_cache.py
 
       - name: Install CUDA Toolkit
         if: runner.name != 'panther-windows-llama'

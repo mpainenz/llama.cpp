@@ -22,7 +22,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Vulkan compiler is unavailable' }
     $revision = (& git rev-parse HEAD).Trim()
     if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'Invalid source revision' }
-    $build = "E:\TensorRelay\BuildCache\fork-$revision"
+    $build = (& python .github/scripts/select-panther-cache.py (Get-Location).Path 'E:\TensorRelay\BuildCache').Trim()
+    if ($LASTEXITCODE -ne 0 -or !$build) { throw 'Build cache selection failed' }
+    Write-Host "Executor build directory: $build"
     New-Item -ItemType Directory -Force $build | Out-Null
     $common = $env:CMAKE_COMMON.Trim() -split '\s+'
     & cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release `
