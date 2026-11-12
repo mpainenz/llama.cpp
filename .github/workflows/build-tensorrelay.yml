@@ -96,7 +96,7 @@ jobs:
           # Skip fully versioned files (libllama.so.0.0.NNNN); nothing
           # references them and they accumulate one per rebuild.
           shopt -s nullglob
-          for lib in build/bin/libllama.so* build/bin/libggml*.so*; do
+          for lib in build/bin/libllama*.so* build/bin/libggml*.so*; do
             case "$(basename "$lib")" in
               *.so|*.so.[0-9]|*.so.[0-9][0-9]) cp -L "$lib" dist/ ;;
             esac
