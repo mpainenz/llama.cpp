@@ -22,7 +22,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: tensorrelay-${{ github.ref }}
+  # A Linux-only trial must not cancel a release's native Windows build.
+  group: tensorrelay-${{ github.ref }}-${{ inputs.local_linux_trial || false }}
   cancel-in-progress: true
 
 env:
