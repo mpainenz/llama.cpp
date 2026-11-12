@@ -7,6 +7,11 @@ import yaml
 
 
 class PantherRoutingTests(unittest.TestCase):
+    def test_linux_trial_has_separate_concurrency_from_release(self):
+        workflow = Path(__file__).resolve().parents[1] / "workflows/build-tensorrelay.yml"
+        concurrency = yaml.safe_load(workflow.read_text())["concurrency"]
+        self.assertEqual(concurrency["group"], "tensorrelay-${{ github.ref }}-${{ inputs.local_linux_trial || false }}")
+
     def test_linux_only_trial_does_not_start_windows(self):
         workflow = Path(__file__).resolve().parents[1] / "workflows/build-tensorrelay.yml"
         job = yaml.safe_load(workflow.read_text())["jobs"]["windows-cuda-x64"]
