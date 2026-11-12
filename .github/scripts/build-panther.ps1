@@ -27,8 +27,9 @@ try {
     Write-Host "Executor build directory: $build"
     New-Item -ItemType Directory -Force $build | Out-Null
     $common = $env:CMAKE_COMMON.Trim() -split '\s+'
+    # Mixed quantized KV needs the optional Flash Attention kernels.
     & cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-        -DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_CUDA_CUB_3DOT2=ON `
+        -DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_CUDA_CUB_3DOT2=ON -DGGML_CUDA_FA_ALL_QUANTS=ON `
         '-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;100;120' @common
     if ($LASTEXITCODE -ne 0) { throw 'Executor configuration failed' }
     & cmake --build $build --target tensorrelay_stage_executor --parallel 4
