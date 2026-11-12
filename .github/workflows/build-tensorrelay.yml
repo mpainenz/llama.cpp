@@ -67,8 +67,6 @@ jobs:
           c++ --version
           python3 tests/test-vulkan-memory.py
           python3 tests/test-linux-runtime.py
-          c++ -std=c++17 -Iinclude -Ivendor -Iggml/include -Icommon tests/test-tensorrelay-chat-options.cpp -o "$RUNNER_TEMP/test-tensorrelay-chat-options"
-          "$RUNNER_TEMP/test-tensorrelay-chat-options"
 
       - name: Build stage executor
         run: |
@@ -81,8 +79,12 @@ jobs:
             -DGGML_VULKAN_SHADER_JOBS=1 \
             -DGGML_VULKAN_SHADER_PARTS=16 \
             -DGGML_CPU_ALL_VARIANTS=ON \
-            ${{ env.CMAKE_COMMON }}
-          cmake --build build --config Release --target tensorrelay_stage_executor -j 1
+            ${{ env.CMAKE_COMMON }} \
+            -DLLAMA_BUILD_TESTS=ON
+          cmake --build build --config Release --target tensorrelay_stage_executor test-tensorrelay-chat-options -j 1
+
+      - name: Test reasoning controls with linked common libraries
+        run: ctest --test-dir build -R '^test-tensorrelay-chat-options$' --output-on-failure
 
       - name: Record memory result
         if: always()
