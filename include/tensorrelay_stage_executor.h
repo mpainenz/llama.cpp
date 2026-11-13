@@ -33,6 +33,9 @@ extern "C" {
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_FINAL_CHUNK  (1u << 1)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_TOKEN_IDS    (1u << 2)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_ACTIVATIONS  (1u << 3)
+// Optional capability `prefill_without_sampling`: compute state without
+// consuming sampler RNG for intermediate prompt chunks whose output is unused.
+#define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_SKIP_SAMPLE  (1u << 4)
 #define TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_FINAL_TEXT  (1u << 0)
 #define TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_ACTIVATIONS (1u << 1)
 #define TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_TOKEN_ID    (1u << 2)

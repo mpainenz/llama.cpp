@@ -767,6 +767,7 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         { "is_final_stage", is_final_stage },
         { "chat_entries", state->chat_templates != nullptr },
         { "checkpoint_version", runtime_ready ? 1 : 0 },
+        { "prefill_without_sampling", runtime_ready },
         { "split_graph_execution", split_graph_execution },
         { "token_input", is_first_stage },
         { "activation_input", !is_first_stage },
@@ -1056,6 +1057,15 @@ static bool execute_split_stage(
         size_t output_cursor = 0;
         for (uint32_t i = 0; i < call->input_count; ++i) {
             auto & output = call->outputs_ptr[i];
+            if (call->inputs_ptr[i].flags & TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_SKIP_SAMPLE) {
+                output.slot_id = call->inputs_ptr[i].slot_id;
+                output.request_epoch = call->inputs_ptr[i].request_epoch;
+                output.activation_offset = static_cast<uint32_t>(output_cursor);
+                output.activation_len = 0;
+                output.sampled_token_id = -1;
+                output.flags = 0;
+                continue;
+            }
             // Per-request sampling: use the chain installed for this
             // (slot, request epoch) at reservation time; fall back to the
             // default chain when none was configured.
@@ -1981,6 +1991,9 @@ int32_t tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t
     std::lock_guard<std::mutex> lock(state->mutex);
     if (slot_id >= state->slot_epochs.size()) {
         return set_error(state, "release references an unknown slot", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    if (request_epoch < state->slot_epochs[slot_id]) {
+        return set_error(state, "release references a stale request epoch", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
     if (state->ctx != nullptr) {
         auto memory = llama_get_memory(state->ctx);
