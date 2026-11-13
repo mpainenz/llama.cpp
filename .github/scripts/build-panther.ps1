@@ -28,7 +28,7 @@ try {
     New-Item -ItemType Directory -Force $build | Out-Null
     $common = $env:CMAKE_COMMON.Trim() -split '\s+'
     & cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-        -DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_CUDA_CUB_3DOT2=ON `
+        -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_VULKAN=ON -DGGML_CUDA_CUB_3DOT2=ON `
         '-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;100;120' @common
     if ($LASTEXITCODE -ne 0) { throw 'Executor configuration failed' }
     & cmake --build $build --target tensorrelay_stage_executor --parallel 4

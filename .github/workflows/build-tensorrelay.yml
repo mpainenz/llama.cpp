@@ -180,7 +180,8 @@ jobs:
           # made it mandatory for GGML_CPU_ALL_VARIANTS; backends now ship as DLLs).
           # v7: CUDA 13.1 -> 13.3, Vulkan SDK 1.4.313.2 -> 1.4.357.0,
           # GGML_NATIVE=OFF entered CMAKE_COMMON (2026-08-15 pin sweep).
-          key: win-cuda13.3-vulkan-v7-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
+          # v8: Include quantized FlashAttention kernels used by TensorRelay KV caches.
+          key: win-cuda13.3-vulkan-v8-${{ hashFiles('ggml/**', 'src/**', 'common/**', 'tools/**', 'CMakeLists.txt', 'ggml/CMakeLists.txt') }}
 
       - name: Build stage executor
         if: runner.name != 'panther-windows-llama' && steps.cache-win-build.outputs.cache-hit != 'true'
@@ -190,6 +191,7 @@ jobs:
           if exist build rmdir /s /q build
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
             -DGGML_VULKAN=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;100;120" ^
@@ -241,6 +243,9 @@ jobs:
           Copy-Item LICENSE dist\
           Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
           if (-not (Test-Path dist\tensorrelay_stage_executor.dll)) { Write-Error "stage executor dll missing" }
+          if ($env:RUNNER_NAME -eq 'panther-windows-llama') {
+            & ./.github/scripts/check-cuda-attention.ps1 -BundlePath dist
+          }
           Compress-Archive -Path dist\* -DestinationPath tensorrelay-stage-executor-win-cuda-13.3-x64.zip
 
       - name: Upload artifacts
