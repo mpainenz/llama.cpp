@@ -766,6 +766,7 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         { "is_first_stage", is_first_stage },
         { "is_final_stage", is_final_stage },
         { "chat_entries", state->chat_templates != nullptr },
+        { "checkpoint_version", runtime_ready ? 1 : 0 },
         { "split_graph_execution", split_graph_execution },
         { "token_input", is_first_stage },
         { "activation_input", !is_first_stage },
@@ -1893,6 +1894,85 @@ int32_t tr_stage_executor_chat_parse(
     return TENSORRELAY_STAGE_EXECUTOR_OK;
 }
 
+static void clear_idle_recurrent_memory(tr_stage_executor_state * state) {
+    if (!llama_model_is_recurrent(state->model) && !llama_model_is_hybrid(state->model)) {
+        return;
+    }
+    auto memory = llama_get_memory(state->ctx);
+    for (size_t seq = 0; seq < state->slot_epochs.size(); ++seq) {
+        if (llama_memory_seq_pos_max(memory, static_cast<llama_seq_id>(seq)) >= 0) {
+            return;
+        }
+    }
+    llama_memory_clear(memory, true);
+}
+
+int32_t tr_stage_executor_checkpoint_export(
+        void * handle, uint32_t slot_id, uint64_t request_epoch,
+        uint8_t * out_ptr, size_t out_cap, size_t * out_len, uint32_t * position) {
+    auto * state = as_state(handle);
+    if (state == nullptr || out_len == nullptr || position == nullptr) {
+        return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->ctx == nullptr) {
+        return set_error(state, "checkpoint requires a loaded runtime", TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED);
+    }
+    if (slot_id >= state->slot_epochs.size() || request_epoch != state->slot_epochs[slot_id]) {
+        return set_error(state, "checkpoint references an invalid slot or epoch", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    const auto last = llama_memory_seq_pos_max(llama_get_memory(state->ctx), slot_id);
+    if (last < 0) {
+        return set_error(state, "checkpoint sequence is empty", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    *position = static_cast<uint32_t>(last) + 1;
+    *out_len = llama_state_seq_get_size(state->ctx, slot_id);
+    if (*out_len == 0) {
+        return set_error(state, "checkpoint sizing failed", TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED);
+    }
+    if (out_ptr != nullptr) {
+        if (out_cap < *out_len) {
+            return set_error(state, "checkpoint buffer is too small", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+        }
+        if (llama_state_seq_get_data(state->ctx, out_ptr, out_cap, slot_id) != *out_len) {
+            return set_error(state, "checkpoint export failed", TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED);
+        }
+    }
+    state->last_error.clear();
+    return TENSORRELAY_STAGE_EXECUTOR_OK;
+}
+
+int32_t tr_stage_executor_checkpoint_import(
+        void * handle, uint32_t slot_id, uint64_t request_epoch, uint32_t position,
+        const uint8_t * data, size_t data_len) {
+    auto * state = as_state(handle);
+    if (state == nullptr) {
+        return TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->ctx == nullptr) {
+        return set_error(state, "checkpoint requires a loaded runtime", TENSORRELAY_STAGE_EXECUTOR_ERR_NOT_LOADED);
+    }
+    if (slot_id >= state->slot_epochs.size() || request_epoch < state->slot_epochs[slot_id] ||
+            data == nullptr || data_len < 8 || position == 0 || position >= state->context_length) {
+        return set_error(state, "invalid checkpoint restore arguments", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    auto memory = llama_get_memory(state->ctx);
+    if (llama_memory_seq_pos_max(memory, slot_id) >= 0) {
+        return set_error(state, "checkpoint target slot is not empty", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
+    state->slot_epochs[slot_id] = request_epoch;
+    reset_slot_sampler(state->slot_samplers[slot_id]);
+    const size_t restored = llama_state_seq_set_data(state->ctx, data, data_len, slot_id);
+    if (restored != data_len || llama_memory_seq_pos_max(memory, slot_id) != static_cast<llama_pos>(position - 1)) {
+        llama_memory_seq_rm(memory, slot_id, -1, -1);
+        clear_idle_recurrent_memory(state);
+        return set_error(state, "checkpoint restore failed", TENSORRELAY_STAGE_EXECUTOR_ERR_UNSUPPORTED);
+    }
+    state->last_error.clear();
+    return TENSORRELAY_STAGE_EXECUTOR_OK;
+}
+
 int32_t tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t request_epoch) {
     auto * state = as_state(handle);
     if (state == nullptr) {
@@ -1907,19 +1987,7 @@ int32_t tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t
         if (!llama_memory_seq_rm(memory, static_cast<llama_seq_id>(slot_id), -1, -1)) {
             return set_error(state, "failed to release sequence memory", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
         }
-        if (llama_model_is_recurrent(state->model) || llama_model_is_hybrid(state->model)) {
-            bool empty = true;
-            for (size_t seq = 0; seq < state->slot_epochs.size(); ++seq) {
-                if (llama_memory_seq_pos_max(memory, static_cast<llama_seq_id>(seq)) >= 0) {
-                    empty = false;
-                    break;
-                }
-            }
-            // Clear recurrent buffers only when no other sequence owns state.
-            if (empty) {
-                llama_memory_clear(memory, true);
-            }
-        }
+        clear_idle_recurrent_memory(state);
     }
     if (slot_id < state->slot_samplers.size()) {
         reset_slot_sampler(state->slot_samplers[slot_id]);
