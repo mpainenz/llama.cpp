@@ -1452,6 +1452,7 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
             return set_error(state, device_error, TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
         }
         llama_model_params model_params = llama_model_default_params();
+        ggml_backend_dev_t cpu_only_devices[] = { nullptr };
         // These must outlive llama_model_load_from_file: it reads the override
         // patterns (regex strings) and buft list during the load.
         std::vector<std::string> spill_patterns;
@@ -1463,6 +1464,8 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
                     TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
             }
             model_params.n_gpu_layers = 0;
+            // Zero GPU layers alone still permits GPU operation offload.
+            model_params.devices = cpu_only_devices;
         } else {
             // with the default LLAMA_SPLIT_MODE_LAYER, llama_model_load_from_file copies
             // the device handles out of this NULL-terminated array, so the local vector
@@ -1546,6 +1549,10 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         ctx_params.no_perf = true;
         ctx_params.embeddings = params->split_count > 1 && params->stage_index < params->split_count - 1;
         ctx_params.n_outputs_max = ctx_params.n_batch;
+        if (state->device_names.empty()) {
+            ctx_params.offload_kqv = false;
+            ctx_params.op_offload = false;
+        }
         // ABI v9 KV Cache Policy: allocate the cache with the manifest-stamped
         // types. Any non-f16 type FORCES flash attention on (quantized caches
         // require it) so an unsupported backend fails the load loudly instead
