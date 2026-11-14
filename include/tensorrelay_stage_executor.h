@@ -47,6 +47,7 @@ typedef struct tr_stage_executor_load_params {
     int32_t     stage_index;
     int32_t     split_count;
     uint32_t    slot_count;
+    // Token capacity per slot; zero selects the default of 4096.
     uint32_t    context_length;
     const uint8_t * shard_path_ptr;
     size_t      shard_path_len;

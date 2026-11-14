@@ -1339,6 +1339,12 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     if (params->slot_count == 0) {
         return set_error(state, "slot_count must be greater than zero", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
     }
+    const uint64_t context_length = params->context_length > 0 ? params->context_length : 4096;
+    const uint64_t padded_context = ((context_length + 255) / 256) * 256;
+    const uint64_t total_context = padded_context * params->slot_count;
+    if (total_context > std::numeric_limits<uint32_t>::max()) {
+        return set_error(state, "context_length times slot_count exceeds native capacity", TENSORRELAY_STAGE_EXECUTOR_ERR_INVALID_ARGUMENT);
+    }
     // ABI v9: validate the KV Cache Policy up front - a bad type name is a
     // caller error regardless of whether this load reaches a llama runtime.
     const std::string cache_type_k_name = bytes_to_string(params->cache_type_k_ptr, params->cache_type_k_len);
@@ -1393,7 +1399,7 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
     state->hidden_dim = metadata.hidden_dim;
     state->block_count = metadata.block_count;
     state->slot_count = params->slot_count;
-    state->context_length = params->context_length;
+    state->context_length = static_cast<uint32_t>(context_length);
     state->pos_streams = 1;
     state->vocab = nullptr;
     state->device_names.clear();
@@ -1514,9 +1520,11 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
         }
 
         llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = state->context_length > 0 ? state->context_length : 4096;
+        // n_ctx is the total allocation; the public context limit is per slot.
+        ctx_params.n_ctx = static_cast<uint32_t>(total_context);
         ctx_params.n_batch = std::min<uint32_t>(ctx_params.n_ctx, 512);
         ctx_params.n_seq_max = std::max<uint32_t>(state->slot_count, 1);
+        ctx_params.kv_unified = false;
         ctx_params.no_perf = true;
         ctx_params.embeddings = params->split_count > 1 && params->stage_index < params->split_count - 1;
         ctx_params.n_outputs_max = ctx_params.n_batch;
