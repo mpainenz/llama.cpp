@@ -1425,7 +1425,7 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
             std::call_once(backend_init_once, []() {
                 install_log_capture();
                 llama_backend_init();
-                ggml_backend_load_all();
+                tensorrelay_load_backends();
             });
         }
         std::vector<ggml_backend_dev_t> devices;

@@ -108,6 +108,7 @@ jobs:
           done
           shopt -u nullglob
           python3 tests/check-linux-runtime.py dist
+          python3 tests/check-backend-discovery.py dist
           cp LICENSE dist/
           echo "Packed libraries:"
           ls -lh dist/*.so* || true
