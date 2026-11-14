@@ -243,6 +243,9 @@ jobs:
           Copy-Item LICENSE dist\
           Get-ChildItem dist\ | Format-Table Name, Length -AutoSize
           if (-not (Test-Path dist\tensorrelay_stage_executor.dll)) { Write-Error "stage executor dll missing" }
+          if ($env:RUNNER_NAME -eq 'panther-windows-llama') {
+            & ./.github/scripts/check-cuda-attention.ps1 -BundlePath dist
+          }
           Compress-Archive -Path dist\* -DestinationPath tensorrelay-stage-executor-win-cuda-13.3-x64.zip
 
       - name: Verify packaged CUDA supports TensorRelay KV cache formats
