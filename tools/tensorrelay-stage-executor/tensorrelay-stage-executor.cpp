@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "chat.h"
 #include "chat-options.h"
 #include "nlohmann/json.hpp"
@@ -785,6 +786,23 @@ static bool build_capabilities_json(tr_stage_executor_state * state, std::string
         { "cache_type_v", state->cache_type_v_applied },
         { "reason", reason },
     };
+    // Backend buffers at query time, not process residency or driver overhead.
+    capabilities["memory_allocations"] = nullptr;
+    if (runtime_ready) {
+        auto allocations = json::array();
+        for (const auto & entry : llama_get_memory_breakdown(state->ctx)) {
+            const auto buft = entry.first;
+            const auto device = ggml_backend_buft_get_device(buft);
+            allocations.push_back({
+                { "buffer_type", ggml_backend_buft_name(buft) },
+                { "device", device ? ggml_backend_dev_name(device) : "" },
+                { "model_bytes", entry.second.model },
+                { "context_bytes", entry.second.context },
+                { "compute_bytes", entry.second.compute },
+            });
+        }
+        capabilities["memory_allocations"] = std::move(allocations);
+    }
     out = capabilities.dump();
     return true;
 }
