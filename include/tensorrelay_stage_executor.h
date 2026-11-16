@@ -33,6 +33,9 @@ extern "C" {
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_FINAL_CHUNK  (1u << 1)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_TOKEN_IDS    (1u << 2)
 #define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_ACTIVATIONS  (1u << 3)
+// Optional capability `prefill_without_sampling`: compute state without
+// consuming sampler RNG for intermediate prompt chunks whose output is unused.
+#define TENSORRELAY_STAGE_EXECUTOR_INPUT_FLAG_SKIP_SAMPLE  (1u << 4)
 #define TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_FINAL_TEXT  (1u << 0)
 #define TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_ACTIVATIONS (1u << 1)
 #define TENSORRELAY_STAGE_EXECUTOR_OUTPUT_FLAG_TOKEN_ID    (1u << 2)
@@ -44,6 +47,7 @@ typedef struct tr_stage_executor_load_params {
     int32_t     stage_index;
     int32_t     split_count;
     uint32_t    slot_count;
+    // Token capacity per slot; zero selects the default of 4096.
     uint32_t    context_length;
     const uint8_t * shard_path_ptr;
     size_t      shard_path_len;
@@ -212,6 +216,22 @@ TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_configure_slot_sampler
     void * handle,
     const tr_stage_executor_sampler_params * params);
 TENSORRELAY_STAGE_EXECUTOR_API int32_t  tr_stage_executor_release_slot(void * handle, uint32_t slot_id, uint64_t request_epoch);
+// Optional checkpoint extension, version 1. Copies sequence memory to host
+// bytes, without retaining device buffers or sampler state. Export is a
+// two-call operation; out_len and position report required bytes and the next
+// token position. A non-null undersized buffer is rejected without writing.
+// The caller must serialize the two calls against execution on this slot.
+TENSORRELAY_STAGE_EXECUTOR_API int32_t tr_stage_executor_checkpoint_export(
+    void * handle, uint32_t slot_id, uint64_t request_epoch,
+    uint8_t * out_ptr, size_t out_cap, size_t * out_len, uint32_t * position);
+// Restore only into an empty slot. The caller verifies ownership, model and
+// configuration identity, bounded length and checksum before passing trusted
+// local bytes from export. Raw checkpoint data is not a network input format.
+// Configure a fresh sampler after restore, then execute at position. On a
+// failed restore the target sequence is cleared; other slots are preserved.
+TENSORRELAY_STAGE_EXECUTOR_API int32_t tr_stage_executor_checkpoint_import(
+    void * handle, uint32_t slot_id, uint64_t request_epoch, uint32_t position,
+    const uint8_t * data, size_t data_len);
 // ABI v6: runs `steps` (capped at TENSORRELAY_STAGE_EXECUTOR_BENCHMARK_MAX_STEPS)
 // batch-1 decode-shaped steps through the loaded stage graph on scratch
 // sequence 0 and reports total wall-clock time plus the stage's layer count.
