@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-tensorrelay-policy-diag.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -906,6 +907,33 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// Records the first refusal and leaves the caller's decision alone.
+// Tensor names and bytes are not copied. The gate string names the
+// existing check that is about to abort.
+static void tr_policy_diag_note_tensor(
+        const char * gate,
+        const char * phase,
+        const struct ggml_tensor * tensor,
+        const char * backend,
+        const char * device,
+        int supports_op) {
+    const char * src_types[GGML_MAX_SRC];
+    int n_src = 0;
+    const char * op = "";
+    const char * dst = "";
+    if (tensor != nullptr) {
+        op = ggml_op_name(tensor->op);
+        dst = ggml_type_name(tensor->type);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr) {
+                continue;
+            }
+            src_types[n_src++] = ggml_type_name(tensor->src[i]->type);
+        }
+    }
+    tr_policy_diag_note(gate, op, "", src_types, n_src, dst, backend, device, phase, supports_op);
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -927,6 +955,9 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     if (tensor->buffer || (tensor->view_src && tensor->view_src->buffer)) {
         // since the tensor is pre-allocated, it cannot be moved to another backend
         ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        tr_policy_diag_note_tensor(
+            "preallocated_unsupported", "1.buffer", tensor,
+            "", buffer != nullptr ? ggml_backend_buffer_name(buffer) : "", 0);
         GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
     }
 
@@ -1280,6 +1311,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            tr_policy_diag_note_tensor("scheduler_unassigned", "4.assign", node, "", "", 0);
+        }
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
@@ -1349,6 +1383,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             const int node_backend_id = tensor_backend_id(node);
 
+            if (node_backend_id == -1) {
+                tr_policy_diag_note_tensor("scheduler_unassigned", "5.split", node, "", "", 0);
+            }
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node

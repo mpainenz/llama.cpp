@@ -1,6 +1,7 @@
 #include "tensorrelay_stage_executor.h"
 
 #include "ggml.h"
+#include "ggml-tensorrelay-policy-diag.h"
 #include "gguf.h"
 #include "llama.h"
 #include "chat.h"
@@ -2153,13 +2154,28 @@ size_t tr_stage_executor_last_error(void * handle, uint8_t * out_ptr, size_t out
 }
 
 size_t tr_stage_executor_read_diagnostics(uint8_t * out_ptr, size_t out_len) {
+    char refusal[1024];
+    const size_t refusal_n = tr_policy_diag_format(refusal, sizeof refusal);
     std::lock_guard<std::mutex> lock(diag_mutex);
+    const bool have_refusal = refusal_n > 0;
+    const size_t extra = have_refusal ? refusal_n + (diag_buffer.empty() ? 0 : 1) : 0;
+    const size_t total = diag_buffer.size() + extra;
     if (out_ptr == nullptr || out_len == 0) {
-        return diag_buffer.size();
+        return total;
     }
-    const size_t n = std::min(out_len, diag_buffer.size());
-    std::memcpy(out_ptr, diag_buffer.data(), n);
-    return n;
+    size_t n = std::min(out_len, diag_buffer.size());
+    if (n > 0) {
+        std::memcpy(out_ptr, diag_buffer.data(), n);
+    }
+    if (!have_refusal || n >= out_len) {
+        return n;
+    }
+    if (!diag_buffer.empty() && n < out_len) {
+        out_ptr[n++] = '\n';
+    }
+    const size_t copy_n = std::min(out_len - n, refusal_n);
+    std::memcpy(out_ptr + n, refusal, copy_n);
+    return n + copy_n;
 }
 
 }
