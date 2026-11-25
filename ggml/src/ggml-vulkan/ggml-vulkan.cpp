@@ -18156,6 +18156,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64)) {
                     return false;
                 }
+                // Q8_0 is advertised only when the SET_ROWS pipeline object exists.
+                // F16 and the other listed types keep their previous result.
+                if (op->type == GGML_TYPE_Q8_0) {
+                    const int src_idx = op->src[0]->type == GGML_TYPE_F16 ? 1 : 0;
+                    const vk_pipeline pipe = op->src[1]->type == GGML_TYPE_I64
+                        ? device->pipeline_set_rows_i64[src_idx][op->type]
+                        : device->pipeline_set_rows_i32[src_idx][op->type];
+                    if (!pipe) {
+                        return false;
+                    }
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

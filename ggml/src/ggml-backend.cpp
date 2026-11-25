@@ -12,6 +12,10 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-tensorrelay-policy-diag.h"
+#include "ggml-tensorrelay-set-rows-policy.h"
+
+#include <inttypes.h>
 
 #include <assert.h>
 #include <limits.h>
@@ -906,6 +910,33 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// Records the first refusal and leaves the caller's decision alone.
+// Tensor names and bytes are not copied. The gate string names the
+// existing check that is about to abort.
+static void tr_policy_diag_note_tensor(
+        const char * gate,
+        const char * phase,
+        const struct ggml_tensor * tensor,
+        const char * backend,
+        const char * device,
+        int supports_op) {
+    const char * src_types[GGML_MAX_SRC];
+    int n_src = 0;
+    const char * op = "";
+    const char * dst = "";
+    if (tensor != nullptr) {
+        op = ggml_op_name(tensor->op);
+        dst = ggml_type_name(tensor->type);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr) {
+                continue;
+            }
+            src_types[n_src++] = ggml_type_name(tensor->src[i]->type);
+        }
+    }
+    tr_policy_diag_note(gate, op, "", src_types, n_src, dst, backend, device, phase, supports_op);
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -927,6 +958,9 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     if (tensor->buffer || (tensor->view_src && tensor->view_src->buffer)) {
         // since the tensor is pre-allocated, it cannot be moved to another backend
         ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        tr_policy_diag_note_tensor(
+            "preallocated_unsupported", "1.buffer", tensor,
+            "", buffer != nullptr ? ggml_backend_buffer_name(buffer) : "", 0);
         GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
     }
 
@@ -1280,6 +1314,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            tr_policy_diag_note_tensor("scheduler_unassigned", "4.assign", node, "", "", 0);
+        }
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
@@ -1349,6 +1386,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             const int node_backend_id = tensor_backend_id(node);
 
+            if (node_backend_id == -1) {
+                tr_policy_diag_note_tensor("scheduler_unassigned", "5.split", node, "", "", 0);
+            }
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
@@ -1577,6 +1617,60 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
+    }
+
+    // Scoped worker gate. Disarmed builds keep the assignment above.
+    // A refusal is not moved onto CPU.
+    if (tr_policy_set_rows_armed()) {
+        static_assert((int) GGML_OP_SET_ROWS == TR_POLICY_OP_SET_ROWS, "SET_ROWS op id");
+        static_assert((int) GGML_TYPE_F32 == TR_POLICY_TYPE_F32, "F32 type id");
+        static_assert((int) GGML_TYPE_F16 == TR_POLICY_TYPE_F16, "F16 type id");
+        static_assert((int) GGML_TYPE_Q8_0 == TR_POLICY_TYPE_Q8_0, "Q8_0 type id");
+        static_assert((int) GGML_TYPE_I64 == TR_POLICY_TYPE_I64, "I64 type id");
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_SET_ROWS) {
+                continue;
+            }
+            const int backend_id = tensor_backend_id(node);
+            const char * name = "";
+            int cpu = 1;
+            int assigned = 0;
+            int supports = 0;
+            if (backend_id >= 0 && backend_id < sched->n_backends && sched->backends[backend_id] != nullptr) {
+                ggml_backend_t backend = sched->backends[backend_id];
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                name = dev != nullptr ? ggml_backend_dev_name(dev) : ggml_backend_name(backend);
+                cpu = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                assigned = tr_policy_set_rows_assigned(name);
+                supports = ggml_backend_supports_op(backend, node) ? 1 : 0;
+            }
+            tr_set_rows_node view = {};
+            view.op = (int) node->op;
+            view.dst_type = (int) node->type;
+            view.src0_type = node->src[0] != nullptr ? (int) node->src[0]->type : -1;
+            view.src1_type = node->src[1] != nullptr ? (int) node->src[1]->type : -1;
+            view.ne0 = node->ne[0];
+            view.ne1 = node->ne[1];
+            view.ne2 = node->ne[2];
+            view.ne3 = node->ne[3];
+            view.assigned_vulkan = assigned;
+            view.cpu = cpu;
+            view.supports_op = supports;
+            view.pipeline_present = supports;
+            int reason = 0;
+            if (tr_policy_set_rows_decide(&view, &reason) != 0) {
+                const char * src_types[2] = { "", "" };
+                tr_policy_diag_note(
+                    "set_rows", "SET_ROWS", "scoped",
+                    src_types, 0, "", name, name, "0", supports);
+                GGML_ABORT(
+                    "TR_POLICY_NODE_REFUSED reason=%d phase=0 op=%d type=%d src0=%d src1=%d host=%d target=%d ne=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64,
+                    reason, view.op, view.dst_type, view.src0_type, view.src1_type,
+                    cpu ? 1 : 0, assigned ? 1 : 0,
+                    view.ne0, view.ne1, view.ne2, view.ne3);
+            }
+        }
     }
 }
 

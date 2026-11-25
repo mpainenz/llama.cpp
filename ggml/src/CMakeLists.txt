@@ -201,6 +201,10 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-tensorrelay-policy-diag.cpp
+            ../include/ggml-tensorrelay-policy-diag.h
+            ggml-tensorrelay-set-rows-policy.cpp
+            ../include/ggml-tensorrelay-set-rows-policy.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
