@@ -1,0 +1,16 @@
+diff --git a/src/llama-tensorrelay-policy.cpp b/src/llama-tensorrelay-policy.cpp
+--- a/src/llama-tensorrelay-policy.cpp
++++ b/src/llama-tensorrelay-policy.cpp
+@@ -1,8 +1,10 @@
+         case GGML_OP_SET_ROWS:
+-            // Scoped KV cache profile: F32 values, I64 rows, F16 storage.
++            // Scoped KV cache profile: F32 values, I64 rows, F16 or block-aligned Q8_0 storage.
+             if (!node->src[0] || !node->src[1] || node->src[0]->type != GGML_TYPE_F32 ||
+-                    node->src[1]->type != GGML_TYPE_I64 || node->type != GGML_TYPE_F16) {
++                    node->src[1]->type != GGML_TYPE_I64 ||
++                    !(node->type == GGML_TYPE_F16 ||
++                      (node->type == GGML_TYPE_Q8_0 && node->ne[0] % QK8_0 == 0))) {
+                 policy.reject(LLAMA_TR_POLICY_NODE_REFUSED);
+                 return false;
+             }
+             break;
