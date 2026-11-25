@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-tensorrelay-policy-diag.h"
+#include "ggml-tensorrelay-set-rows-policy.h"
 #include "gguf.h"
 #include "llama.h"
 #include "chat.h"
@@ -1300,6 +1301,7 @@ int32_t tr_stage_executor_create(void ** out_handle) {
 }
 
 void tr_stage_executor_destroy(void * handle) {
+    tr_policy_set_rows_disarm();
     auto * state = as_state(handle);
     if (state != nullptr) {
         reset_all_slot_samplers(state);
@@ -1493,6 +1495,16 @@ int32_t tr_stage_executor_load(void * handle, const tr_stage_executor_load_param
             // Set last: a GPU spill target may have push_back'd onto `devices`,
             // reallocating it, so bind the pointer only after the final layout.
             model_params.devices = devices.data();
+        }
+        {
+            const char * armed[8] = {};
+            int armed_count = 0;
+            for (const std::string & name : state->device_names) {
+                if (armed_count < 8) {
+                    armed[armed_count++] = name.c_str();
+                }
+            }
+            tr_policy_set_rows_arm(armed, armed_count);
         }
         state->model = llama_model_load_from_file(state->shard_path.c_str(), model_params);
         if (state->model == nullptr) {

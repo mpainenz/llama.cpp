@@ -13,6 +13,9 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-tensorrelay-policy-diag.h"
+#include "ggml-tensorrelay-set-rows-policy.h"
+
+#include <inttypes.h>
 
 #include <assert.h>
 #include <limits.h>
@@ -1614,6 +1617,60 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
+    }
+
+    // Scoped worker gate. Disarmed builds keep the assignment above.
+    // A refusal is not moved onto CPU.
+    if (tr_policy_set_rows_armed()) {
+        static_assert((int) GGML_OP_SET_ROWS == TR_POLICY_OP_SET_ROWS, "SET_ROWS op id");
+        static_assert((int) GGML_TYPE_F32 == TR_POLICY_TYPE_F32, "F32 type id");
+        static_assert((int) GGML_TYPE_F16 == TR_POLICY_TYPE_F16, "F16 type id");
+        static_assert((int) GGML_TYPE_Q8_0 == TR_POLICY_TYPE_Q8_0, "Q8_0 type id");
+        static_assert((int) GGML_TYPE_I64 == TR_POLICY_TYPE_I64, "I64 type id");
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_SET_ROWS) {
+                continue;
+            }
+            const int backend_id = tensor_backend_id(node);
+            const char * name = "";
+            int cpu = 1;
+            int assigned = 0;
+            int supports = 0;
+            if (backend_id >= 0 && backend_id < sched->n_backends && sched->backends[backend_id] != nullptr) {
+                ggml_backend_t backend = sched->backends[backend_id];
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                name = dev != nullptr ? ggml_backend_dev_name(dev) : ggml_backend_name(backend);
+                cpu = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                assigned = tr_policy_set_rows_assigned(name);
+                supports = ggml_backend_supports_op(backend, node) ? 1 : 0;
+            }
+            tr_set_rows_node view = {};
+            view.op = (int) node->op;
+            view.dst_type = (int) node->type;
+            view.src0_type = node->src[0] != nullptr ? (int) node->src[0]->type : -1;
+            view.src1_type = node->src[1] != nullptr ? (int) node->src[1]->type : -1;
+            view.ne0 = node->ne[0];
+            view.ne1 = node->ne[1];
+            view.ne2 = node->ne[2];
+            view.ne3 = node->ne[3];
+            view.assigned_vulkan = assigned;
+            view.cpu = cpu;
+            view.supports_op = supports;
+            view.pipeline_present = supports;
+            int reason = 0;
+            if (tr_policy_set_rows_decide(&view, &reason) != 0) {
+                const char * src_types[2] = { "", "" };
+                tr_policy_diag_note(
+                    "set_rows", "SET_ROWS", "scoped",
+                    src_types, 0, "", name, name, "0", supports);
+                GGML_ABORT(
+                    "TR_POLICY_NODE_REFUSED reason=%d phase=0 op=%d type=%d src0=%d src1=%d host=%d target=%d ne=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64,
+                    reason, view.op, view.dst_type, view.src0_type, view.src1_type,
+                    cpu ? 1 : 0, assigned ? 1 : 0,
+                    view.ne0, view.ne1, view.ne2, view.ne3);
+            }
+        }
     }
 }
 

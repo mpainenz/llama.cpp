@@ -25,3 +25,10 @@ target_compile_features(test-tensorrelay-policy-diag PRIVATE cxx_std_17)
 find_package(Threads REQUIRED)
 target_link_libraries(test-tensorrelay-policy-diag PRIVATE Threads::Threads)
 add_test(NAME test-tensorrelay-policy-diag COMMAND test-tensorrelay-policy-diag)
+
+add_executable(test-tensorrelay-set-rows-policy
+    test-tensorrelay-set-rows-policy.cpp)
+target_include_directories(test-tensorrelay-set-rows-policy PRIVATE ../../ggml/include)
+target_compile_features(test-tensorrelay-set-rows-policy PRIVATE cxx_std_17)
+target_link_libraries(test-tensorrelay-set-rows-policy PRIVATE ggml-base Threads::Threads)
+add_test(NAME test-tensorrelay-set-rows-policy COMMAND test-tensorrelay-set-rows-policy)
